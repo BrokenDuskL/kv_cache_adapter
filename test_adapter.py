@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from kv_cache_adapter.benchmark_lmcache_backend import BenchmarkConfig, run_benchmark
 from kv_cache_adapter import (
     BlockNotFoundError,
     InMemoryBlockStoreBackend,
@@ -248,3 +249,27 @@ def test_lmcache_backend_loads_into_target_slots_in_place() -> None:
     )
 
     backend.shutdown()
+
+
+def test_lmcache_benchmark_smoke() -> None:
+    pytest.importorskip("lmcache")
+    results = run_benchmark(
+        BenchmarkConfig(
+            num_actual_blocks=8,
+            num_logical_blocks=32,
+            batch_size=4,
+            steps=4,
+            warmup_steps=1,
+            block_shape=(64,),
+            hit_rates=(0.0, 0.5, 1.0),
+            max_local_cpu_size_gb=0.01,
+        )
+    )
+
+    assert len(results) == 3
+    for result in results:
+        assert 0.0 <= result.achieved_load_hit_rate <= 1.0
+        assert 0.0 <= result.achieved_save_hit_rate <= 1.0
+        assert result.avg_load_ms >= 0.0
+        assert result.avg_save_ms >= 0.0
+        assert result.total_seconds >= 0.0
