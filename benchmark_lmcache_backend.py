@@ -38,6 +38,14 @@ class BenchmarkResult:
     save_ops_per_sec: float
 
 
+@dataclass(frozen=True)
+class _IterationStats:
+    load_seconds: float
+    save_seconds: float
+    load_hits: int
+    save_hits: int
+
+
 def run_benchmark(config: BenchmarkConfig) -> list[BenchmarkResult]:
     _validate_config(config)
     return [_run_single_hit_rate(config, hit_rate) for hit_rate in config.hit_rates]
@@ -77,19 +85,21 @@ def main() -> None:
         max_local_cpu_size_gb=args.max_local_cpu_size_gb,
     )
     results = run_benchmark(config)
+    device = _benchmark_device()
     print(
         "config -> "
         f"actual={config.num_actual_blocks}, logical={config.num_logical_blocks}, "
         f"batch={config.batch_size}, steps={config.steps}, warmup={config.warmup_steps}, "
-        f"block_shape={config.block_shape}, dtype={config.dtype}"
+        f"block_shape={config.block_shape}, dtype={config.dtype}, device={device}"
     )
     print(format_results(results))
 
 
 def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> BenchmarkResult:
+    device = _benchmark_device()
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.seed + int(target_hit_rate * 1000))
-    all_logical_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64)
+    all_logical_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
 
     backend = LMCacheBackend(
         block_shape=config.block_shape,
@@ -103,6 +113,7 @@ def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> Ben
         actual_blocks=torch.zeros(
             (config.num_actual_blocks, *config.block_shape),
             dtype=config.dtype,
+            device=device,
         ),
         backend=backend,
     )
@@ -110,10 +121,11 @@ def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> Ben
     try:
         backend.save_blocks(
             all_logical_ids,
-            _make_initial_payloads(config, generator),
+            _make_initial_payloads(config, generator, device=device),
         )
         initial_resident = all_logical_ids[: config.num_actual_blocks]
-        adapter.load(initial_resident)
+        initial_physical_ids = adapter.load(initial_resident)
+        _require_physical_ids_on_device(initial_physical_ids, device)
         adapter.release(initial_resident)
 
         for _ in range(config.warmup_steps):
@@ -125,6 +137,7 @@ def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> Ben
         total_save_hits = 0
         total_load_blocks = 0
         total_save_blocks = 0
+        _synchronize_device(device)
         total_start = time.perf_counter()
         for _ in range(config.steps):
             stats = _run_iteration(adapter, all_logical_ids, config, target_hit_rate, generator, measure=True)
@@ -134,6 +147,7 @@ def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> Ben
             total_save_hits += stats.save_hits
             total_load_blocks += config.batch_size
             total_save_blocks += config.batch_size
+        _synchronize_device(device)
         total_seconds = time.perf_counter() - total_start
     finally:
         adapter.shutdown()
@@ -150,14 +164,6 @@ def _run_single_hit_rate(config: BenchmarkConfig, target_hit_rate: float) -> Ben
     )
 
 
-@dataclass(frozen=True)
-class _IterationStats:
-    load_seconds: float
-    save_seconds: float
-    load_hits: int
-    save_hits: int
-
-
 def _run_iteration(
     adapter: KVCacheAdapter,
     all_logical_ids: torch.Tensor,
@@ -169,16 +175,21 @@ def _run_iteration(
 ) -> _IterationStats:
     load_ids = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
     load_hits = int((adapter._logical_to_physical.index_select(0, load_ids) >= 0).sum().item())
+    _synchronize_device(load_ids.device)
     load_start = time.perf_counter()
-    adapter.load(load_ids)
+    loaded_physical_ids = adapter.load(load_ids)
+    _synchronize_device(load_ids.device)
     load_seconds = time.perf_counter() - load_start if measure else 0.0
+    _require_physical_ids_on_device(loaded_physical_ids, load_ids.device)
     adapter.release(load_ids)
 
     save_ids = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
     save_hits = int((adapter._logical_to_physical.index_select(0, save_ids) >= 0).sum().item())
-    save_payloads = _make_random_payloads(config, generator)
+    save_payloads = _make_random_payloads(config, generator, device=all_logical_ids.device)
+    _synchronize_device(save_ids.device)
     save_start = time.perf_counter()
     adapter.save(save_ids, save_payloads)
+    _synchronize_device(save_ids.device)
     save_seconds = time.perf_counter() - save_start if measure else 0.0
 
     return _IterationStats(
@@ -201,7 +212,6 @@ def _sample_batch_ids(
 
     hit_count = int(round(batch_size * target_hit_rate))
     miss_count = batch_size - hit_count
-
     if hit_count > resident_ids.numel():
         raise ValueError("target hit rate requires more resident ids than available")
     if miss_count > cold_ids.numel():
@@ -214,8 +224,8 @@ def _sample_batch_ids(
         parts.append(_sample_unique_ids(cold_ids, miss_count, generator))
 
     merged = torch.cat(parts, dim=0)
-    shuffle = torch.randperm(merged.numel(), generator=generator)
-    return merged.index_select(0, shuffle)
+    permutation = torch.randperm(merged.numel(), generator=generator, device="cpu")
+    return merged.index_select(0, permutation.to(device=merged.device))
 
 
 def _resident_unpinned_ids(adapter: KVCacheAdapter) -> torch.Tensor:
@@ -225,7 +235,7 @@ def _resident_unpinned_ids(adapter: KVCacheAdapter) -> torch.Tensor:
 
 
 def _cold_ids(all_logical_ids: torch.Tensor, resident_ids: torch.Tensor) -> torch.Tensor:
-    cold_mask = torch.ones(all_logical_ids.shape[0], dtype=torch.bool)
+    cold_mask = torch.ones(all_logical_ids.shape[0], dtype=torch.bool, device=all_logical_ids.device)
     if resident_ids.numel() > 0:
         cold_mask[resident_ids] = False
     return all_logical_ids[cold_mask]
@@ -234,11 +244,16 @@ def _cold_ids(all_logical_ids: torch.Tensor, resident_ids: torch.Tensor) -> torc
 def _sample_unique_ids(pool: torch.Tensor, count: int, generator: torch.Generator) -> torch.Tensor:
     if count == 0:
         return pool[:0]
-    indices = torch.randperm(pool.numel(), generator=generator)[:count]
-    return pool.index_select(0, indices)
+    indices = torch.randperm(pool.numel(), generator=generator, device="cpu")[:count]
+    return pool.index_select(0, indices.to(device=pool.device))
 
 
-def _make_initial_payloads(config: BenchmarkConfig, generator: torch.Generator) -> torch.Tensor:
+def _make_initial_payloads(
+    config: BenchmarkConfig,
+    generator: torch.Generator,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
     total_elements = config.num_logical_blocks
     for dim in config.block_shape:
         total_elements *= dim
@@ -246,17 +261,22 @@ def _make_initial_payloads(config: BenchmarkConfig, generator: torch.Generator) 
         config.num_logical_blocks,
         *config.block_shape,
     )
-    permutation = torch.randperm(config.num_logical_blocks, generator=generator)
-    return payloads.index_select(0, permutation).to(dtype=config.dtype)
+    permutation = torch.randperm(config.num_logical_blocks, generator=generator, device="cpu")
+    return payloads.index_select(0, permutation).to(device=device, dtype=config.dtype)
 
 
-def _make_random_payloads(config: BenchmarkConfig, generator: torch.Generator) -> torch.Tensor:
+def _make_random_payloads(
+    config: BenchmarkConfig,
+    generator: torch.Generator,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
     payloads = torch.randn(
         (config.batch_size, *config.block_shape),
         generator=generator,
         dtype=torch.float32,
     )
-    return payloads.to(dtype=config.dtype)
+    return payloads.to(device=device, dtype=config.dtype)
 
 
 def _validate_config(config: BenchmarkConfig) -> None:
@@ -304,6 +324,28 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-local-cpu-size-gb", type=float, default=0.25)
     parser.add_argument("--hit-rates", nargs="+", type=float, default=[0.0, 0.5, 0.9, 1.0])
     return parser.parse_args()
+
+
+def _benchmark_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _require_physical_ids_on_device(physical_ids: torch.Tensor, expected_device: torch.device) -> None:
+    if physical_ids.device.type != expected_device.type:
+        raise RuntimeError(
+            "adapter.load() returned physical ids on the wrong device type: "
+            f"expected {expected_device}, got {physical_ids.device}"
+        )
+    if expected_device.index is not None and physical_ids.device.index != expected_device.index:
+        raise RuntimeError(
+            "adapter.load() returned physical ids on the wrong device: "
+            f"expected {expected_device}, got {physical_ids.device}"
+        )
 
 
 if __name__ == "__main__":

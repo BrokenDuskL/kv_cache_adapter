@@ -29,12 +29,31 @@ def make_adapter(
     )
 
 
-def make_payload(rows: list[list[int]]) -> torch.Tensor:
-    return torch.tensor(rows, dtype=torch.float32)
+def make_payload(rows: list[list[int]], *, device: torch.device | str = "cpu") -> torch.Tensor:
+    return torch.tensor(rows, dtype=torch.float32, device=device)
 
 
 def assert_tensor_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert torch.equal(actual, expected)
+
+
+def assert_loaded_payloads(
+    adapter: KVCacheAdapter,
+    logical_block_ids: torch.Tensor,
+    expected_payloads: dict[int, torch.Tensor],
+) -> None:
+    physical_slot_ids = adapter.load(logical_block_ids)
+
+    for logical_block_id, physical_slot_id in zip(
+        logical_block_ids.detach().cpu().tolist(),
+        physical_slot_ids.detach().cpu().tolist(),
+    ):
+        assert_tensor_equal(
+            adapter.get_actual_block(int(physical_slot_id)),
+            expected_payloads[logical_block_id],
+        )
+
+    adapter.release(logical_block_ids)
 
 
 def test_free_slots_are_preloaded_into_reusable_lru() -> None:
@@ -218,6 +237,80 @@ def test_save_updates_actual_blocks_with_tensor_copy() -> None:
     assert torch.equal(
         snapshot["actual_blocks"],
         make_payload([[200, 201], [300, 301]]),
+    )
+
+    adapter.shutdown()
+
+
+@pytest.mark.parametrize("prefer_cuda_extension", [False, True])
+def test_save_and_load_round_trip_across_evictions_uses_public_interface(
+    prefer_cuda_extension: bool,
+) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    adapter = KVCacheAdapter(
+        num_actual_blocks=2,
+        num_logical_blocks=8,
+        actual_blocks=torch.zeros((2, 2), dtype=torch.float32, device=device),
+        backend=InMemoryBlockStoreBackend(num_logical_blocks=8),
+        prefer_cuda_extension=prefer_cuda_extension,
+    )
+    expected_payloads = {
+        0: make_payload([[10, 11]], device=device)[0],
+        1: make_payload([[20, 21]], device=device)[0],
+        2: make_payload([[30, 31]], device=device)[0],
+        3: make_payload([[40, 41]], device=device)[0],
+        4: make_payload([[50, 51]], device=device)[0],
+    }
+
+    adapter.save(
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        torch.stack((expected_payloads[0], expected_payloads[1]), dim=0),
+    )
+    assert_loaded_payloads(
+        adapter,
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        expected_payloads,
+    )
+
+    adapter.save(
+        torch.tensor([2], dtype=torch.int64, device=device),
+        expected_payloads[2].unsqueeze(0),
+    )
+    assert_loaded_payloads(
+        adapter,
+        torch.tensor([1, 2], dtype=torch.int64, device=device),
+        expected_payloads,
+    )
+
+    adapter.save(
+        torch.tensor([3], dtype=torch.int64, device=device),
+        expected_payloads[3].unsqueeze(0),
+    )
+    assert_loaded_payloads(
+        adapter,
+        torch.tensor([3, 0], dtype=torch.int64, device=device),
+        expected_payloads,
+    )
+
+    expected_payloads[2] = make_payload([[300, 301]], device=device)[0]
+    adapter.save(
+        torch.tensor([2], dtype=torch.int64, device=device),
+        expected_payloads[2].unsqueeze(0),
+    )
+    assert_loaded_payloads(
+        adapter,
+        torch.tensor([2, 1], dtype=torch.int64, device=device),
+        expected_payloads,
+    )
+
+    adapter.save(
+        torch.tensor([4], dtype=torch.int64, device=device),
+        expected_payloads[4].unsqueeze(0),
+    )
+    assert_loaded_payloads(
+        adapter,
+        torch.tensor([4, 3], dtype=torch.int64, device=device),
+        expected_payloads,
     )
 
     adapter.shutdown()
