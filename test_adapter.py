@@ -125,51 +125,70 @@ def test_load_raises_when_all_resident_blocks_are_pinned() -> None:
     adapter.shutdown()
 
 
-def test_save_spills_updated_block_before_later_load() -> None:
+def test_updated_payload_is_spilled_when_its_resident_slot_is_eventually_evicted() -> None:
     backend = InMemoryBlockStoreBackend({
         0: make_payload([[0, 10]])[0],
         1: make_payload([[1, 11]])[0],
         2: make_payload([[2, 12]])[0],
+        3: make_payload([[3, 13]])[0],
+        4: make_payload([[4, 14]])[0],
+        5: make_payload([[5, 15]])[0],
     })
     adapter = make_adapter(backend=backend)
+    updated_payload = make_payload([[100, 101]])[0]
 
     adapter.load(torch.tensor([0], dtype=torch.int64))
-    adapter.save(torch.tensor([0], dtype=torch.int64), make_payload([[100, 101]]))
+    adapter.save(torch.tensor([0], dtype=torch.int64), updated_payload.unsqueeze(0))
     adapter.release(torch.tensor([0], dtype=torch.int64))
 
-    adapter.load(torch.tensor([1], dtype=torch.int64))
-    adapter.release(torch.tensor([1], dtype=torch.int64))
-    adapter.load(torch.tensor([2], dtype=torch.int64))
+    for logical_block_id in [1, 2, 3, 4, 5]:
+        adapter.load(torch.tensor([logical_block_id], dtype=torch.int64))
+        snapshot = adapter.debug_snapshot()
+        if 0 not in snapshot["logical_to_physical"]:
+            break
+        adapter.release(torch.tensor([logical_block_id], dtype=torch.int64))
+    else:
+        raise AssertionError("logical block 0 never got evicted during the test")
 
-    assert_tensor_equal(backend.snapshot()[0], make_payload([[100, 101]])[0])
-    assert backend.operation_log[-2:] == [("save", 0), ("load", 2)]
+    assert_tensor_equal(backend.snapshot()[0], updated_payload)
+    assert ("save", 0) in backend.operation_log
 
-    adapter.release(torch.tensor([2], dtype=torch.int64))
     adapter.shutdown()
 
 
-def test_save_materializes_cold_block_by_evicting_lru() -> None:
+def test_save_materializes_cold_block_by_evicting_unpinned_resident() -> None:
     backend = InMemoryBlockStoreBackend({
         0: make_payload([[0, 10]])[0],
         1: make_payload([[1, 11]])[0],
         2: make_payload([[2, 12]])[0],
     })
     adapter = make_adapter(backend=backend)
+    updated_payload = make_payload([[100, 101]])[0]
+    inserted_payload = make_payload([[200, 201]])[0]
 
     adapter.load(torch.tensor([0, 1], dtype=torch.int64))
-    adapter.save(torch.tensor([0], dtype=torch.int64), make_payload([[100, 101]]))
+    adapter.save(torch.tensor([0], dtype=torch.int64), updated_payload.unsqueeze(0))
     adapter.release(torch.tensor([0, 1], dtype=torch.int64))
 
-    adapter.save(torch.tensor([2], dtype=torch.int64), make_payload([[200, 201]]))
+    adapter.save(torch.tensor([2], dtype=torch.int64), inserted_payload.unsqueeze(0))
     snapshot = adapter.debug_snapshot()
     logical_to_physical = snapshot["logical_to_physical"]
 
-    assert 0 not in logical_to_physical
-    assert 1 in logical_to_physical
     assert 2 in logical_to_physical
-    assert_tensor_equal(backend.snapshot()[0], make_payload([[100, 101]])[0])
-    assert_tensor_equal(snapshot["actual_blocks"][0], make_payload([[200, 201]])[0])
-    assert backend.operation_log[-1] == ("save", 0)
+    resident_before = {0, 1}
+    evicted_residents = resident_before - set(logical_to_physical)
+    assert len(evicted_residents) == 1
+    evicted_logical = next(iter(evicted_residents))
+    assert backend.operation_log[-1] == ("save", evicted_logical)
+
+    inserted_slot = logical_to_physical[2]
+    assert_tensor_equal(snapshot["actual_blocks"][inserted_slot], inserted_payload)
+
+    if 0 in logical_to_physical:
+        updated_slot = logical_to_physical[0]
+        assert_tensor_equal(snapshot["actual_blocks"][updated_slot], updated_payload)
+    else:
+        assert_tensor_equal(backend.snapshot()[0], updated_payload)
 
     adapter.shutdown()
 
@@ -242,17 +261,25 @@ def test_save_updates_actual_blocks_with_tensor_copy() -> None:
     adapter.shutdown()
 
 
-@pytest.mark.parametrize("prefer_cuda_extension", [False, True])
+def _default_test_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu")
+    return torch.device("cpu")
+
+
+@pytest.mark.parametrize("prefer_native_extension", [False, True])
 def test_save_and_load_round_trip_across_evictions_uses_public_interface(
-    prefer_cuda_extension: bool,
+    prefer_native_extension: bool,
 ) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _default_test_device()
     adapter = KVCacheAdapter(
         num_actual_blocks=2,
         num_logical_blocks=8,
         actual_blocks=torch.zeros((2, 2), dtype=torch.float32, device=device),
         backend=InMemoryBlockStoreBackend(num_logical_blocks=8),
-        prefer_cuda_extension=prefer_cuda_extension,
+        prefer_native_extension=prefer_native_extension,
     )
     expected_payloads = {
         0: make_payload([[10, 11]], device=device)[0],

@@ -73,9 +73,12 @@ class KVCacheAdapter:
         backend: BlockStoreBackend,
         *,
         max_workers: int | None = None,
-        prefer_cuda_extension: bool = True,
+        prefer_native_extension: bool = True,
+        prefer_cuda_extension: bool | None = None,
     ) -> None:
         del max_workers
+        if prefer_cuda_extension is not None:
+            prefer_native_extension = prefer_cuda_extension
         if not isinstance(actual_blocks, torch.Tensor):
             raise TypeError("actual_blocks must be torch.Tensor")
         if actual_blocks.ndim < 1:
@@ -117,8 +120,8 @@ class KVCacheAdapter:
         self._reusable_mask = torch.ones((num_actual_blocks,), dtype=torch.bool, device=device)
         self._usage_count = torch.zeros((num_actual_blocks,), dtype=USAGE_DTYPE, device=device)
         self._search_start = torch.zeros((1,), dtype=ID_DTYPE, device=device)
-        self._cuda_ext = self._detect_cuda_extension(prefer_cuda_extension=prefer_cuda_extension)
-        self.runtime_path = "cuda_ext_meta" if self._cuda_ext is not None else "strict"
+        self._native_ext, self.runtime_path = self._detect_native_extension(
+            prefer_native_extension=prefer_native_extension)
 
     def save(self, logical_block_ids: torch.Tensor, block_data: torch.Tensor) -> None:
         _require_id_tensor(logical_block_ids, name="logical_block_ids")
@@ -268,10 +271,22 @@ class KVCacheAdapter:
         if callable(backend_close):
             backend_close()
 
-    def _detect_cuda_extension(self, *, prefer_cuda_extension: bool) -> Any | None:
-        if not prefer_cuda_extension or self.actual_blocks.device.type != "cuda":
-            return None
-        return _load_cuda_extension_module()
+    def _detect_native_extension(
+        self,
+        *,
+        prefer_native_extension: bool,
+    ) -> tuple[Any | None, str]:
+        if not prefer_native_extension:
+            return None, "strict"
+
+        device_type = self.actual_blocks.device.type
+        if device_type == "cuda":
+            native_ext = _load_cuda_extension_module()
+            return native_ext, "cuda_ext_meta" if native_ext is not None else "strict"
+        if device_type in {"npu", "privateuseone"}:
+            native_ext = _load_npu_extension_module()
+            return native_ext, "npu_ext_meta" if native_ext is not None else "strict"
+        return None, "strict"
 
     def _unique_preserve_order(self, values: torch.Tensor) -> torch.Tensor:
         _require_id_tensor(values, name="values")
@@ -289,9 +304,9 @@ class KVCacheAdapter:
         self,
         logical_block_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._cuda_ext is not None:
+        if self._native_ext is not None:
             return tuple(
-                self._cuda_ext.inspect_load_requests(
+                self._native_ext.inspect_load_requests(
                     self._logical_to_physical.contiguous(),
                     self._slot_state.contiguous(),
                     self._pin_count.contiguous(),
@@ -322,9 +337,9 @@ class KVCacheAdapter:
         self,
         logical_block_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._cuda_ext is not None:
+        if self._native_ext is not None:
             return tuple(
-                self._cuda_ext.inspect_save_requests(
+                self._native_ext.inspect_save_requests(
                     self._logical_to_physical.contiguous(),
                     self._slot_state.contiguous(),
                     self._usage_count.contiguous(),
@@ -353,8 +368,8 @@ class KVCacheAdapter:
             return self._logical_to_physical[:0]
 
         blocked_slot_ids = blocked_slot_ids.contiguous()
-        if self._cuda_ext is not None:
-            return self._cuda_ext.pop_reusable_slots(
+        if self._native_ext is not None:
+            return self._native_ext.pop_reusable_slots(
                 self._usage_count.contiguous(),
                 self._reusable_mask.contiguous(),
                 self._search_start.contiguous(),
@@ -427,8 +442,8 @@ class KVCacheAdapter:
     ) -> None:
         empty_ids = self._logical_to_physical[:0]
         empty_usage = self._usage_count[:0]
-        if self._cuda_ext is not None:
-            self._cuda_ext.commit_load_metadata(
+        if self._native_ext is not None:
+            self._native_ext.commit_load_metadata(
                 self._logical_to_physical.contiguous(),
                 self._physical_to_logical.contiguous(),
                 self._slot_state.contiguous(),
@@ -471,8 +486,8 @@ class KVCacheAdapter:
     ) -> None:
         empty_ids = self._logical_to_physical[:0]
         empty_usage = self._usage_count[:0]
-        if self._cuda_ext is not None:
-            self._cuda_ext.commit_save_metadata(
+        if self._native_ext is not None:
+            self._native_ext.commit_save_metadata(
                 self._logical_to_physical.contiguous(),
                 self._physical_to_logical.contiguous(),
                 self._slot_state.contiguous(),
@@ -820,6 +835,14 @@ class _NoopMemoryAllocator:
 def _load_cuda_extension_module() -> Any | None:
     try:
         return importlib.import_module("kv_cache_adapter_cuda")
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _load_npu_extension_module() -> Any | None:
+    try:
+        return importlib.import_module("kv_cache_adapter_npu")
     except Exception:
         return None
 

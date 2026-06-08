@@ -24,6 +24,8 @@ class BenchmarkConfig:
 def synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type in {"npu", "privateuseone"} and hasattr(torch, "npu"):
+        torch.npu.synchronize()
 
 
 def resident_unpinned_ids(adapter: KVCacheAdapter) -> torch.Tensor:
@@ -85,7 +87,7 @@ def make_adapter(
     config: BenchmarkConfig,
     *,
     device: torch.device,
-    prefer_cuda_extension: bool,
+    prefer_native_extension: bool,
 ) -> KVCacheAdapter:
     payloads = torch.arange(
         config.num_logical_blocks * config.block_size,
@@ -103,23 +105,23 @@ def make_adapter(
         num_logical_blocks=config.num_logical_blocks,
         actual_blocks=actual_blocks,
         backend=backend,
-        prefer_cuda_extension=prefer_cuda_extension,
+        prefer_native_extension=prefer_native_extension,
     )
 
 
 def benchmark_runtime_path(
     config: BenchmarkConfig,
     *,
-    prefer_cuda_extension: bool,
+    device: torch.device,
+    prefer_native_extension: bool,
 ) -> tuple[str, list[tuple[float, float, float]]]:
-    device = torch.device("cuda")
     all_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
     generator = torch.Generator(device="cpu")
-    generator.manual_seed(config.seed + (0 if prefer_cuda_extension else 100000))
+    generator.manual_seed(config.seed + (0 if prefer_native_extension else 100000))
     adapter = make_adapter(
         config,
         device=device,
-        prefer_cuda_extension=prefer_cuda_extension,
+        prefer_native_extension=prefer_native_extension,
     )
     results: list[tuple[float, float, float]] = []
     try:
@@ -170,7 +172,7 @@ def benchmark_runtime_path(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark KVCacheAdapter runtime paths on CUDA")
+    parser = argparse.ArgumentParser(description="Benchmark KVCacheAdapter runtime paths on the current accelerator")
     parser.add_argument("--num-actual-blocks", type=int, default=256)
     parser.add_argument("--num-logical-blocks", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -182,8 +184,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        device = torch.device("npu")
+    else:
+        raise SystemExit("CUDA or NPU is required")
     args = parse_args()
     config = BenchmarkConfig(
         num_actual_blocks=args.num_actual_blocks,
@@ -194,8 +200,16 @@ def main() -> None:
         block_size=args.block_size,
         seed=args.seed,
     )
-    strict_runtime, strict_results = benchmark_runtime_path(config, prefer_cuda_extension=False)
-    ext_runtime, ext_results = benchmark_runtime_path(config, prefer_cuda_extension=True)
+    strict_runtime, strict_results = benchmark_runtime_path(
+        config,
+        device=device,
+        prefer_native_extension=False,
+    )
+    ext_runtime, ext_results = benchmark_runtime_path(
+        config,
+        device=device,
+        prefer_native_extension=True,
+    )
 
     print("runtime | hit_rate | avg_load_ms | avg_save_ms")
     print("--- | --- | --- | ---")
