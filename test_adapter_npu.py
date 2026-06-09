@@ -44,7 +44,7 @@ def test_npu_runtime_path_selection() -> None:
         backend=InMemoryBlockStoreBackend(num_logical_blocks=8),
         prefer_native_extension=True,
     )
-    assert adapter.runtime_path in {"npu_ext_meta", "strict"}
+    assert adapter.runtime_path == "npu_ext_meta"
 
 
 def test_npu_round_trip_across_evictions() -> None:
@@ -76,13 +76,6 @@ def test_npu_runtime_benchmark_smoke() -> None:
     logical_ids = torch.arange(0, 512, dtype=torch.int64, device="npu")
     payload_bank = torch.randn((1024, 64), dtype=torch.float16, device="npu")
 
-    strict_adapter = KVCacheAdapter(
-        num_actual_blocks=128,
-        num_logical_blocks=1024,
-        actual_blocks=torch.zeros((128, 64), dtype=torch.float16, device="npu"),
-        backend=InMemoryBlockStoreBackend(initial_data=payload_bank),
-        prefer_native_extension=False,
-    )
     native_adapter = KVCacheAdapter(
         num_actual_blocks=128,
         num_logical_blocks=1024,
@@ -92,15 +85,6 @@ def test_npu_runtime_benchmark_smoke() -> None:
     )
 
     torch.npu.synchronize()
-    strict_start = time.perf_counter()
-    for step in range(16):
-        start = (step * 23) % (logical_ids.numel() - 64)
-        req = logical_ids[start : start + 64]
-        strict_adapter.load(req)
-        strict_adapter.release(req)
-    torch.npu.synchronize()
-    strict_elapsed = time.perf_counter() - strict_start
-
     native_start = time.perf_counter()
     for step in range(16):
         start = (step * 23) % (logical_ids.numel() - 64)
@@ -110,5 +94,4 @@ def test_npu_runtime_benchmark_smoke() -> None:
     torch.npu.synchronize()
     native_elapsed = time.perf_counter() - native_start
 
-    assert strict_elapsed >= 0.0
     assert native_elapsed >= 0.0

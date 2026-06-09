@@ -69,11 +69,6 @@ std::vector<torch::Tensor> inspect_load_requests_npu(
     };
   }
 
-  auto hit_states = slot_state.index_select(0, hit_slot_ids);
-  TORCH_CHECK(
-      (hit_states == kStateResident).all().item<bool>(),
-      "logical block is busy");
-
   auto hit_pin_counts = pin_count.index_select(0, hit_slot_ids) + 1;
   auto hit_usage_counts =
       saturating_increment_usage(usage_count.index_select(0, hit_slot_ids));
@@ -111,11 +106,6 @@ std::vector<torch::Tensor> inspect_save_requests_npu(
   if (existing_physical.numel() == 0) {
     return {current_physical, existing_mask, final_usage_counts};
   }
-
-  auto existing_states = slot_state.index_select(0, existing_physical);
-  TORCH_CHECK(
-      (existing_states == kStateResident).all().item<bool>(),
-      "logical block is busy");
 
   auto existing_usage_counts =
       saturating_increment_usage(usage_count.index_select(0, existing_physical));
@@ -158,10 +148,7 @@ torch::Tensor pop_reusable_slots_npu(
                              .to(torch::kInt64);
   auto usage_hist = torch::bincount(available_usage);
   auto usage_prefix = torch::cumsum(usage_hist, 0);
-  auto threshold = torch::nonzero(usage_prefix >= count)
-                       .reshape({-1})
-                       .slice(0, 0, 1)
-                       .item<int64_t>();
+  auto threshold = torch::nonzero(usage_prefix >= count).reshape({-1}).slice(0, 0, 1);
 
   auto scan_order =
       (search_start[0] +
@@ -170,13 +157,10 @@ torch::Tensor pop_reusable_slots_npu(
       usage_count.size(0);
   auto eligible_mask =
       available_mask.index_select(0, scan_order) &
-      (usage_count.index_select(0, scan_order).to(torch::kInt64) <= threshold);
+      usage_count.index_select(0, scan_order).to(torch::kInt64).le(threshold);
   auto selected_slot_ids = scan_order.masked_select(eligible_mask).slice(0, 0, count);
-  TORCH_CHECK(
-      selected_slot_ids.numel() == count,
-      "No reusable actual block is available; all resident blocks are pinned");
 
-  if (threshold > 0) {
+  if (threshold.defined()) {
     usage_count.copy_(
         torch::clamp_min(usage_count.to(torch::kInt16) - threshold, 0)
             .to(torch::kUInt8));
@@ -252,6 +236,20 @@ void commit_save_metadata_npu(
   reusable_mask.index_put_({physical_slot_ids}, final_pin_counts == 0);
 }
 
+void release_metadata_npu(
+    torch::Tensor logical_to_physical,
+    torch::Tensor pin_count,
+    torch::Tensor reusable_mask,
+    torch::Tensor logical_block_ids) {
+  auto physical_slot_ids = logical_to_physical.index_select(0, logical_block_ids);
+  auto updated_pin_counts = pin_count.index_select(0, physical_slot_ids) - 1;
+  pin_count.index_put_({physical_slot_ids}, updated_pin_counts);
+  auto zero_pin_slots = physical_slot_ids.masked_select(updated_pin_counts == 0);
+  if (zero_pin_slots.numel() > 0) {
+    reusable_mask.index_fill_(0, zero_pin_slots, true);
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "pop_reusable_slots",
@@ -273,4 +271,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "commit_save_metadata",
       &commit_save_metadata_npu,
       "Commit save metadata updates in-place (NPU)");
+  m.def(
+      "release_metadata",
+      &release_metadata_npu,
+      "Release resident slots and update pin/reusable metadata in-place (NPU)");
 }

@@ -55,6 +55,12 @@ void commit_save_metadata_cuda(
     torch::Tensor final_pin_counts,
     torch::Tensor final_usage_counts);
 
+void release_metadata_cuda(
+    torch::Tensor logical_to_physical,
+    torch::Tensor pin_count,
+    torch::Tensor reusable_mask,
+    torch::Tensor logical_block_ids);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "pop_reusable_slots",
@@ -86,4 +92,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "commit_save_metadata",
       &commit_save_metadata_cuda,
       "Commit save metadata updates in-place (CUDA)");
+  m.def(
+      "release_metadata",
+      &release_metadata_cuda,
+      "Release resident slots and update pin/reusable metadata in-place (CUDA)");
 }

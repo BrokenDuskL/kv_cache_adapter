@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
+import pathlib
 import time
 from dataclasses import dataclass
 from functools import lru_cache
@@ -72,11 +74,9 @@ class KVCacheAdapter:
         actual_blocks: torch.Tensor,
         backend: BlockStoreBackend,
         *,
-        max_workers: int | None = None,
         prefer_native_extension: bool = True,
         prefer_cuda_extension: bool | None = None,
     ) -> None:
-        del max_workers
         if prefer_cuda_extension is not None:
             prefer_native_extension = prefer_cuda_extension
         if not isinstance(actual_blocks, torch.Tensor):
@@ -175,12 +175,11 @@ class KVCacheAdapter:
         if logical_block_ids.numel() == 0:
             return torch.empty_like(logical_block_ids)
 
-        unique_ids = self._unique_preserve_order(logical_block_ids)
         current_physical, resident_mask, updated_pin_counts, _ = self._inspect_load_requests(
-            unique_ids,
+            logical_block_ids,
         )
         hit_slot_ids = current_physical[resident_mask]
-        miss_logical_ids = unique_ids[~resident_mask]
+        miss_logical_ids = logical_block_ids[~resident_mask]
         miss_physical_slot_ids = self._pop_reusable_slots(miss_logical_ids.shape[0], blocked_slot_ids=hit_slot_ids)
         eviction_plan = self._build_eviction_plan(miss_logical_ids, miss_physical_slot_ids)
 
@@ -218,22 +217,20 @@ class KVCacheAdapter:
         _require_id_tensor(logical_block_ids, name="logical_block_ids")
         _require_same_device(logical_block_ids, expected_device=self.actual_blocks.device, name="logical_block_ids")
         self._validate_logical_block_ids(logical_block_ids)
-        unique_ids = self._unique_preserve_order(logical_block_ids)
-        if unique_ids.numel() == 0:
+        if logical_block_ids.numel() == 0:
             return
 
-        physical_slot_ids = self._logical_to_physical.index_select(0, unique_ids)
-        if torch.any(physical_slot_ids < 0).item():
-            raise KeyError("logical block is not resident")
+        if self._native_ext is not None and hasattr(self._native_ext, "release_metadata"):
+            self._native_ext.release_metadata(
+                self._logical_to_physical.contiguous(),
+                self._pin_count.contiguous(),
+                self._reusable_mask.contiguous(),
+                logical_block_ids.contiguous(),
+            )
+            return
 
-        states = self._slot_state.index_select(0, physical_slot_ids)
-        if torch.any(states != STATE_RESIDENT).item():
-            raise KVCacheAdapterError("logical block is busy")
-
+        physical_slot_ids = self._logical_to_physical.index_select(0, logical_block_ids)
         pin_counts = self._pin_count.index_select(0, physical_slot_ids)
-        if torch.any(pin_counts <= 0).item():
-            raise KVCacheAdapterError("logical block is not pinned")
-
         updated_pin_counts = pin_counts - 1
         self._pin_count.index_put_((physical_slot_ids,), updated_pin_counts)
         zero_pin_slots = physical_slot_ids[updated_pin_counts == 0]
@@ -242,7 +239,7 @@ class KVCacheAdapter:
 
     def get_actual_block(self, physical_slot_id: int) -> torch.Tensor:
         self._validate_physical_slot_id(physical_slot_id)
-        return self.actual_blocks[physical_slot_id].detach().clone()
+        return self.actual_blocks[physical_slot_id]
 
     def debug_snapshot(self) -> dict[str, object]:
         reusable_slots = self._ordered_reusable_slots()
@@ -276,29 +273,24 @@ class KVCacheAdapter:
         *,
         prefer_native_extension: bool,
     ) -> tuple[Any | None, str]:
-        if not prefer_native_extension:
-            return None, "strict"
-
         device_type = self.actual_blocks.device.type
         if device_type == "cuda":
+            if not prefer_native_extension:
+                raise RuntimeError("CUDA actual_blocks require kv_cache_adapter_cuda; strict CUDA path is disabled")
             native_ext = _load_cuda_extension_module()
-            return native_ext, "cuda_ext_meta" if native_ext is not None else "strict"
+            if native_ext is None:
+                raise RuntimeError("CUDA actual_blocks require kv_cache_adapter_cuda, but the extension is unavailable")
+            return native_ext, "cuda_ext_meta"
         if device_type in {"npu", "privateuseone"}:
+            if not prefer_native_extension:
+                raise RuntimeError("NPU actual_blocks require kv_cache_adapter_npu; strict NPU path is disabled")
             native_ext = _load_npu_extension_module()
-            return native_ext, "npu_ext_meta" if native_ext is not None else "strict"
+            if native_ext is None:
+                raise RuntimeError("NPU actual_blocks require kv_cache_adapter_npu, but the extension is unavailable")
+            return native_ext, "npu_ext_meta"
+        if not prefer_native_extension:
+            return None, "strict"
         return None, "strict"
-
-    def _unique_preserve_order(self, values: torch.Tensor) -> torch.Tensor:
-        _require_id_tensor(values, name="values")
-        if values.numel() <= 1:
-            return values
-        positions = torch.arange(values.numel(), device=values.device, dtype=ID_DTYPE)
-        sentinel = values.new_full((self.num_logical_blocks,), values.numel())
-        sentinel.scatter_reduce_(0, values, positions, reduce="amin", include_self=True)
-        present_ids = torch.nonzero(sentinel < values.numel(), as_tuple=False).reshape(-1)
-        first_positions = sentinel.index_select(0, present_ids)
-        order = torch.argsort(first_positions, stable=True)
-        return present_ids.index_select(0, order)
 
     def _inspect_load_requests(
         self,
@@ -320,12 +312,12 @@ class KVCacheAdapter:
         updated_pin_counts = torch.zeros_like(logical_block_ids)
         updated_usage_counts = torch.zeros_like(logical_block_ids, dtype=USAGE_DTYPE)
 
-        if resident_mask.numel() == 0 or not torch.any(resident_mask).item():
+        if resident_mask.numel() == 0 or not torch.any(resident_mask):
             return current_physical, resident_mask, updated_pin_counts, updated_usage_counts
 
         hit_slot_ids = current_physical[resident_mask]
         hit_states = self._slot_state.index_select(0, hit_slot_ids)
-        if torch.any(hit_states != STATE_RESIDENT).item():
+        if torch.any(hit_states != STATE_RESIDENT):
             raise KVCacheAdapterError("logical block is busy")
         hit_pin_counts = self._pin_count.index_select(0, hit_slot_ids) + 1
         hit_usage_counts = _saturating_increment_usage(self._usage_count.index_select(0, hit_slot_ids))
@@ -351,12 +343,12 @@ class KVCacheAdapter:
         existing_mask = current_physical >= 0
         final_usage_counts = torch.ones_like(logical_block_ids, dtype=USAGE_DTYPE)
 
-        if existing_mask.numel() == 0 or not torch.any(existing_mask).item():
+        if existing_mask.numel() == 0 or not torch.any(existing_mask):
             return current_physical, existing_mask, final_usage_counts
 
         existing_physical = current_physical[existing_mask]
         existing_states = self._slot_state.index_select(0, existing_physical)
-        if torch.any(existing_states != STATE_RESIDENT).item():
+        if torch.any(existing_states != STATE_RESIDENT):
             raise KVCacheAdapterError("logical block is busy")
         final_usage_counts[existing_mask] = _saturating_increment_usage(
             self._usage_count.index_select(0, existing_physical),
@@ -387,7 +379,7 @@ class KVCacheAdapter:
         available_usage = self._usage_count.index_select(0, available_slot_ids).to(dtype=torch.int64)
         usage_hist = torch.bincount(available_usage, minlength=USAGE_COUNT_MAX + 1)
         usage_prefix = torch.cumsum(usage_hist, dim=0)
-        threshold = int(torch.nonzero(usage_prefix >= count, as_tuple=False)[0, 0].item())
+        threshold = int(torch.nonzero(usage_prefix >= count, as_tuple=False)[0, 0])
 
         scan_order = (
             self._search_start[0] + torch.arange(self.num_actual_blocks, device=self.actual_blocks.device, dtype=ID_DTYPE)
@@ -421,7 +413,7 @@ class KVCacheAdapter:
             & (previous_logical_ids >= 0)
             & (previous_logical_ids != logical_block_ids)
         )
-        if not torch.any(eviction_mask).item():
+        if not torch.any(eviction_mask):
             return _EvictionPlan(logical_block_ids[:0], self.actual_blocks[:0])
 
         eviction_logical_ids = previous_logical_ids[eviction_mask]
@@ -529,7 +521,9 @@ class KVCacheAdapter:
     def _validate_logical_block_ids(self, logical_block_ids: torch.Tensor) -> None:
         if logical_block_ids.numel() == 0:
             return
-        if torch.any(logical_block_ids < 0).item() or torch.any(logical_block_ids >= self.num_logical_blocks).item():
+        if logical_block_ids.device.type in {"cuda", "npu", "privateuseone"}:
+            return
+        if torch.any(logical_block_ids < 0) or torch.any(logical_block_ids >= self.num_logical_blocks):
             raise ValueError(f"logical block ids must be inside [0, {self.num_logical_blocks})")
 
     def _validate_physical_slot_id(self, physical_slot_id: int) -> None:
@@ -548,6 +542,7 @@ class InMemoryBlockStoreBackend:
         load_delay_s: float = 0.0,
     ) -> None:
         self._storage: torch.Tensor | None = None
+        self._present_mask: torch.Tensor | None = None
         if isinstance(initial_data, torch.Tensor):
             if initial_data.ndim < 1:
                 raise ValueError("initial_data tensor must have a leading block dimension")
@@ -558,9 +553,9 @@ class InMemoryBlockStoreBackend:
             elif num_logical_blocks != inferred_blocks:
                 raise ValueError("num_logical_blocks must match initial_data.shape[0]")
             self._present_mask = (
-                present_mask.detach().clone().to(device="cpu")
+                present_mask.detach().clone().to(device=self._storage.device)
                 if present_mask is not None
-                else torch.ones((num_logical_blocks,), dtype=torch.bool)
+                else torch.ones((num_logical_blocks,), dtype=torch.bool, device=self._storage.device)
             )
         else:
             if num_logical_blocks is None:
@@ -568,18 +563,18 @@ class InMemoryBlockStoreBackend:
                     num_logical_blocks = max(initial_data) + 1
                 else:
                     raise ValueError("num_logical_blocks is required when initial_data is empty")
-            self._present_mask = (
-                present_mask.detach().clone().to(device="cpu")
-                if present_mask is not None
-                else torch.zeros((num_logical_blocks,), dtype=torch.bool)
-            )
+            self._present_mask = present_mask.detach().clone() if present_mask is not None else None
             if initial_data:
                 first_payload = next(iter(initial_data.values()))
                 self._storage = first_payload.new_zeros((num_logical_blocks, *first_payload.shape))
+                if self._present_mask is None:
+                    self._present_mask = torch.zeros((num_logical_blocks,), dtype=torch.bool, device=first_payload.device)
+                else:
+                    self._present_mask = self._present_mask.to(device=first_payload.device)
                 initial_ids = torch.tensor(list(initial_data.keys()), dtype=ID_DTYPE, device=first_payload.device)
                 initial_payloads = torch.stack([initial_data[key] for key in initial_data.keys()], dim=0)
                 self._storage.index_copy_(0, initial_ids, initial_payloads)
-                self._present_mask.index_fill_(0, initial_ids.cpu(), True)
+                self._present_mask.index_fill_(0, initial_ids, True)
 
         self.num_logical_blocks = int(num_logical_blocks)
         self._save_delay_s = save_delay_s
@@ -604,15 +599,14 @@ class InMemoryBlockStoreBackend:
             else:
                 _require_trailing_shape(block_data, self._storage, name="block_data")
                 _require_same_dtype(block_data, reference=self._storage, name="block_data")
+            self._ensure_present_mask(device=self._storage.device)
             self._storage.index_copy_(
                 0,
                 logical_block_ids.to(device=self._storage.device),
                 block_data.to(device=self._storage.device, dtype=self._storage.dtype),
             )
-            self._present_mask.index_fill_(0, logical_block_ids.to(device="cpu"), True)
-            logical_ids_list = logical_block_ids.detach().to(device="cpu").tolist()
-            self.save_calls.extend(logical_ids_list)
-            self.operation_log.extend(("save", logical_block_id) for logical_block_id in logical_ids_list)
+            self._present_mask.index_fill_(0, logical_block_ids.to(device=self._storage.device), True)
+            self._record_ids("save", logical_block_ids)
         finally:
             self._leave_save()
 
@@ -632,7 +626,8 @@ class InMemoryBlockStoreBackend:
                 time.sleep(self._load_delay_s)
             if self._storage is None:
                 raise BlockNotFoundError("backend storage is empty")
-            hit_mask = self._present_mask.index_select(0, logical_block_ids.to(device="cpu"))
+            self._ensure_present_mask(device=self._storage.device)
+            hit_mask = self._present_mask.index_select(0, logical_block_ids.to(device=self._storage.device))
             if not torch.all(hit_mask).item():
                 raise BlockNotFoundError("some logical blocks are not in backend")
             _require_trailing_shape(actual_blocks, self._storage, name="actual_blocks")
@@ -645,9 +640,7 @@ class InMemoryBlockStoreBackend:
                 physical_slot_ids.to(device=actual_blocks.device),
                 loaded_payloads.to(device=actual_blocks.device, dtype=actual_blocks.dtype),
             )
-            logical_ids_list = logical_block_ids.detach().to(device="cpu").tolist()
-            self.load_calls.extend(logical_ids_list)
-            self.operation_log.extend(("load", logical_block_id) for logical_block_id in logical_ids_list)
+            self._record_ids("load", logical_block_ids)
         finally:
             self._leave_load()
 
@@ -678,6 +671,22 @@ class InMemoryBlockStoreBackend:
     def shutdown(self) -> None:
         return None
 
+    def _ensure_present_mask(self, *, device: torch.device) -> None:
+        if self._present_mask is None:
+            self._present_mask = torch.zeros((self.num_logical_blocks,), dtype=torch.bool, device=device)
+        elif self._present_mask.device != device:
+            self._present_mask = self._present_mask.to(device=device)
+
+    def _record_ids(self, operation: str, logical_block_ids: torch.Tensor) -> None:
+        if logical_block_ids.device.type != "cpu":
+            return
+        logical_ids_list = logical_block_ids.detach().tolist()
+        if operation == "save":
+            self.save_calls.extend(logical_ids_list)
+        else:
+            self.load_calls.extend(logical_ids_list)
+        self.operation_log.extend((operation, logical_block_id) for logical_block_id in logical_ids_list)
+
 
 class LMCacheBackend:
     def __init__(
@@ -691,12 +700,16 @@ class LMCacheBackend:
         max_local_cpu_size_gb: float = 1.0,
         lmcache_instance_id: str | None = None,
     ) -> None:
+        _ensure_lmcache_c_ops_ready()
         from lmcache.utils import CacheEngineKey
+        from lmcache.v1.gpu_connector.gpu_ops import lmcache_memcpy_async_d2h, lmcache_memcpy_async_h2d
         from lmcache.v1.config import LMCacheEngineConfig
         from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj
         from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
         self._CacheEngineKey = CacheEngineKey
+        self._lmcache_memcpy_async_d2h = lmcache_memcpy_async_d2h
+        self._lmcache_memcpy_async_h2d = lmcache_memcpy_async_h2d
         self._MemoryFormat = MemoryFormat
         self._MemoryObjMetadata = MemoryObjMetadata
         self._TensorMemoryObj = TensorMemoryObj
@@ -705,6 +718,7 @@ class LMCacheBackend:
         self._model_name = model_name
         self._world_size = world_size
         self._worker_id = worker_id
+        self._prefer_pinned_host = torch.cuda.is_available()
         self._config = LMCacheEngineConfig(
             local_cpu=True,
             max_local_cpu_size=max_local_cpu_size_gb,
@@ -722,13 +736,13 @@ class LMCacheBackend:
         if logical_block_ids.numel() == 0:
             return
 
-        logical_block_ids_cpu = logical_block_ids.to(device="cpu")
-        payloads_cpu = block_data.detach().to(device="cpu").contiguous()
+        logical_block_ids_cpu = self._logical_ids_to_cpu(logical_block_ids)
         keys = self._make_keys(logical_block_ids_cpu)
+        memory_objs = self._make_memory_objs_from_payloads(block_data)
         self._backend.batched_remove(keys)
         self._backend.batched_submit_put_task(
             keys,
-            [self._make_memory_obj(payload) for payload in payloads_cpu.unbind(0)],
+            memory_objs,
         )
 
     def load_blocks(
@@ -745,21 +759,35 @@ class LMCacheBackend:
         if logical_block_ids.numel() == 0:
             return
 
-        logical_block_ids_cpu = logical_block_ids.to(device="cpu")
+        logical_block_ids_cpu = self._logical_ids_to_cpu(logical_block_ids)
         memory_objs = self._backend.batched_get_blocking(self._make_keys(logical_block_ids_cpu))
         if any(memory_obj is None for memory_obj in memory_objs):
             raise BlockNotFoundError("some logical blocks are not in LMCache")
 
         try:
-            loaded_payloads = torch.stack(
-                [memory_obj.tensor for memory_obj in memory_objs if memory_obj is not None],
-                dim=0,
+            physical_slot_ids_device = (
+                physical_slot_ids
+                if physical_slot_ids.device == actual_blocks.device
+                else physical_slot_ids.to(device=actual_blocks.device)
             )
-            actual_blocks.index_copy_(
-                0,
-                physical_slot_ids.to(device=actual_blocks.device),
-                loaded_payloads.to(device=actual_blocks.device, dtype=actual_blocks.dtype),
-            )
+            if actual_blocks.device.type == "cpu":
+                loaded_payloads_cpu = torch.stack(
+                    [memory_obj.tensor for memory_obj in memory_objs if memory_obj is not None],
+                    dim=0,
+                )
+                actual_blocks.index_copy_(
+                    0,
+                    physical_slot_ids_device,
+                    loaded_payloads_cpu.to(dtype=actual_blocks.dtype),
+                )
+                return
+
+            for memory_obj, physical_slot_id in zip(memory_objs, self._logical_ids_to_cpu(physical_slot_ids), strict=False):
+                self._lmcache_memcpy_async_h2d(
+                    memory_obj,
+                    actual_blocks[physical_slot_id],
+                )
+            _synchronize_device(actual_blocks.device)
         finally:
             for memory_obj in memory_objs:
                 if memory_obj is not None:
@@ -780,6 +808,28 @@ class LMCacheBackend:
             )
             for logical_block_id in logical_block_ids.tolist()
         ]
+
+    def _logical_ids_to_cpu(self, logical_block_ids: torch.Tensor) -> torch.Tensor:
+        if logical_block_ids.device.type == "cpu":
+            return logical_block_ids.contiguous()
+        return logical_block_ids.to(device="cpu")
+
+    def _make_memory_objs_from_payloads(self, block_data: torch.Tensor) -> list[object]:
+        if block_data.device.type == "cpu":
+            payloads_cpu = block_data.detach().contiguous()
+            return [self._make_memory_obj(payload) for payload in payloads_cpu.unbind(0)]
+
+        payloads_cpu = torch.empty(
+            block_data.shape,
+            dtype=block_data.dtype,
+            device="cpu",
+            pin_memory=self._prefer_pinned_host and block_data.device.type == "cuda",
+        )
+        memory_objs = [self._make_memory_obj(payload) for payload in payloads_cpu.unbind(0)]
+        for source_payload, memory_obj in zip(block_data.detach().unbind(0), memory_objs, strict=False):
+            self._lmcache_memcpy_async_d2h(source_payload, memory_obj)
+        _synchronize_device(block_data.device)
+        return memory_objs
 
     def _make_memory_obj(self, payload: torch.Tensor) -> object:
         payload = payload.contiguous()
@@ -883,3 +933,38 @@ def _require_block_data_tensor(block_data: torch.Tensor, *, expected_blocks: int
 def _require_trailing_shape(block_data: torch.Tensor, reference: torch.Tensor, *, name: str) -> None:
     if block_data.ndim != reference.ndim or block_data.shape[1:] != reference.shape[1:]:
         raise ValueError(f"{name} must have trailing shape {tuple(reference.shape[1:])}")
+
+
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type in {"npu", "privateuseone"} and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+
+
+@lru_cache(maxsize=1)
+def _ensure_lmcache_c_ops_ready() -> None:
+    try:
+        importlib.import_module("lmcache.c_ops")
+        return
+    except ImportError as first_error:
+        torch_libdir = pathlib.Path(torch.__file__).resolve().parent / "lib"
+        preload_names = (
+            "libc10.so",
+            "libtorch.so",
+            "libtorch_cpu.so",
+            "libtorch_python.so",
+        )
+        cuda_names = (
+            "libc10_cuda.so",
+            "libtorch_cuda.so",
+        )
+        for name in preload_names + cuda_names:
+            lib_path = torch_libdir / name
+            if lib_path.exists():
+                ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+        try:
+            importlib.import_module("lmcache.c_ops")
+            return
+        except ImportError:
+            raise first_error

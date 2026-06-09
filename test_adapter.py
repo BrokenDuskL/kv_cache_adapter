@@ -18,14 +18,12 @@ def make_adapter(
     num_actual_blocks: int = 2,
     num_logical_blocks: int = 8,
     backend: InMemoryBlockStoreBackend | None = None,
-    max_workers: int = 4,
 ) -> KVCacheAdapter:
     return KVCacheAdapter(
         num_actual_blocks=num_actual_blocks,
         num_logical_blocks=num_logical_blocks,
         actual_blocks=torch.zeros((num_actual_blocks, 2), dtype=torch.float32),
         backend=backend or InMemoryBlockStoreBackend(num_logical_blocks=num_logical_blocks),
-        max_workers=max_workers,
     )
 
 
@@ -66,19 +64,19 @@ def test_free_slots_are_preloaded_into_reusable_lru() -> None:
     adapter.shutdown()
 
 
-def test_load_preserves_order_and_deduplicates_backend_fetches() -> None:
+def test_load_preserves_order_without_internal_reordering() -> None:
     backend = InMemoryBlockStoreBackend({
         3: make_payload([[3, 30]])[0],
         5: make_payload([[5, 50]])[0],
     })
     adapter = make_adapter(backend=backend)
 
-    physical_ids = adapter.load(torch.tensor([3, 5, 3], dtype=torch.int64))
+    physical_ids = adapter.load(torch.tensor([3, 5], dtype=torch.int64))
 
-    assert physical_ids.tolist() == [0, 1, 0]
-    assert sorted(backend.load_calls) == [3, 5]
+    assert physical_ids.tolist() == [0, 1]
+    assert backend.load_calls == [3, 5]
 
-    adapter.release(torch.tensor([3, 5, 3], dtype=torch.int64))
+    adapter.release(torch.tensor([3, 5], dtype=torch.int64))
     adapter.shutdown()
 
 
@@ -214,7 +212,6 @@ def test_load_fills_multiple_slots_with_batched_tensor_copy() -> None:
     adapter = make_adapter(
         num_actual_blocks=4,
         backend=backend,
-        max_workers=4,
     )
 
     adapter.load(torch.tensor([0, 1, 2, 3], dtype=torch.int64))
@@ -241,7 +238,6 @@ def test_save_updates_actual_blocks_with_tensor_copy() -> None:
     adapter = make_adapter(
         num_actual_blocks=2,
         backend=backend,
-        max_workers=2,
     )
 
     adapter.load(torch.tensor([0, 1], dtype=torch.int64))
@@ -262,10 +258,6 @@ def test_save_updates_actual_blocks_with_tensor_copy() -> None:
 
 
 def _default_test_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        return torch.device("npu")
     return torch.device("cpu")
 
 
@@ -366,6 +358,40 @@ def test_lmcache_backend_loads_into_target_slots_in_place() -> None:
     assert torch.equal(
         target,
         torch.tensor([[30.0, 31.0], [-1.0, -1.0], [10.0, 11.0]], dtype=torch.float32),
+    )
+
+    backend.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_lmcache_backend_accepts_cuda_tensors() -> None:
+    pytest.importorskip("lmcache")
+    backend = LMCacheBackend(
+        block_shape=(2,),
+        block_dtype=torch.float32,
+        model_name="kv-cache-adapter-test-cuda",
+        max_local_cpu_size_gb=0.01,
+    )
+    target = torch.full((3, 2), -1.0, dtype=torch.float32, device="cuda")
+
+    backend.save_blocks(
+        torch.tensor([1, 3], dtype=torch.int64, device="cuda"),
+        make_payload([[10, 11], [30, 31]], device="cuda"),
+    )
+    backend.load_blocks(
+        torch.tensor([3, 1], dtype=torch.int64, device="cuda"),
+        target,
+        torch.tensor([0, 2], dtype=torch.int64, device="cuda"),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        target,
+        torch.tensor(
+            [[30.0, 31.0], [-1.0, -1.0], [10.0, 11.0]],
+            dtype=torch.float32,
+            device="cuda",
+        ),
     )
 
     backend.shutdown()

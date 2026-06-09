@@ -113,15 +113,14 @@ def benchmark_runtime_path(
     config: BenchmarkConfig,
     *,
     device: torch.device,
-    prefer_native_extension: bool,
 ) -> tuple[str, list[tuple[float, float, float]]]:
     all_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
     generator = torch.Generator(device="cpu")
-    generator.manual_seed(config.seed + (0 if prefer_native_extension else 100000))
+    generator.manual_seed(config.seed)
     adapter = make_adapter(
         config,
         device=device,
-        prefer_native_extension=prefer_native_extension,
+        prefer_native_extension=True,
     )
     results: list[tuple[float, float, float]] = []
     try:
@@ -200,23 +199,15 @@ def main() -> None:
         block_size=args.block_size,
         seed=args.seed,
     )
-    strict_runtime, strict_results = benchmark_runtime_path(
+    runtime_path, results = benchmark_runtime_path(
         config,
         device=device,
-        prefer_native_extension=False,
-    )
-    ext_runtime, ext_results = benchmark_runtime_path(
-        config,
-        device=device,
-        prefer_native_extension=True,
     )
 
     print("runtime | hit_rate | avg_load_ms | avg_save_ms")
     print("--- | --- | --- | ---")
-    for hit_rate, load_ms, save_ms in strict_results:
-        print(f"{strict_runtime} | {hit_rate:.1f} | {load_ms:.3f} | {save_ms:.3f}")
-    for hit_rate, load_ms, save_ms in ext_results:
-        print(f"{ext_runtime} | {hit_rate:.1f} | {load_ms:.3f} | {save_ms:.3f}")
+    for hit_rate, load_ms, save_ms in results:
+        print(f"{runtime_path} | {hit_rate:.1f} | {load_ms:.3f} | {save_ms:.3f}")
 
 
 if __name__ == "__main__":

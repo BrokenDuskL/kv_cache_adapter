@@ -173,8 +173,7 @@ def _run_iteration(
     *,
     measure: bool,
 ) -> _IterationStats:
-    load_ids = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
-    load_hits = int((adapter._logical_to_physical.index_select(0, load_ids) >= 0).sum().item())
+    load_ids, load_hits = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
     _synchronize_device(load_ids.device)
     load_start = time.perf_counter()
     loaded_physical_ids = adapter.load(load_ids)
@@ -183,8 +182,7 @@ def _run_iteration(
     _require_physical_ids_on_device(loaded_physical_ids, load_ids.device)
     adapter.release(load_ids)
 
-    save_ids = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
-    save_hits = int((adapter._logical_to_physical.index_select(0, save_ids) >= 0).sum().item())
+    save_ids, save_hits = _sample_batch_ids(adapter, all_logical_ids, config.batch_size, target_hit_rate, generator)
     save_payloads = _make_random_payloads(config, generator, device=all_logical_ids.device)
     _synchronize_device(save_ids.device)
     save_start = time.perf_counter()
@@ -206,7 +204,7 @@ def _sample_batch_ids(
     batch_size: int,
     target_hit_rate: float,
     generator: torch.Generator,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     resident_ids = _resident_unpinned_ids(adapter)
     cold_ids = _cold_ids(all_logical_ids, resident_ids)
 
@@ -225,7 +223,7 @@ def _sample_batch_ids(
 
     merged = torch.cat(parts, dim=0)
     permutation = torch.randperm(merged.numel(), generator=generator, device="cpu")
-    return merged.index_select(0, permutation.to(device=merged.device))
+    return merged.index_select(0, permutation.to(device=merged.device)), hit_count
 
 
 def _resident_unpinned_ids(adapter: KVCacheAdapter) -> torch.Tensor:
@@ -327,12 +325,18 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _benchmark_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu")
+    return torch.device("cpu")
 
 
 def _synchronize_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+    elif device.type in {"npu", "privateuseone"} and hasattr(torch, "npu"):
+        torch.npu.synchronize()
 
 
 def _require_physical_ids_on_device(physical_ids: torch.Tensor, expected_device: torch.device) -> None:

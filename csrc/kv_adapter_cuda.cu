@@ -50,10 +50,6 @@ void check_cuda_tensor(
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-int32_t read_status(torch::Tensor status) {
-  return status.cpu().item<int32_t>();
-}
-
 __device__ __forceinline__ bool is_blocked_slot(
     int64_t slot_id,
     const int64_t* blocked_slot_ids,
@@ -426,6 +422,14 @@ torch::Tensor pop_reusable_slots_cuda(
   auto selected_slot_ids = torch::empty(
       {count},
       torch::TensorOptions().device(usage_count.device()).dtype(torch::kInt64));
+  auto available_mask = reusable_mask.clone();
+  if (blocked_slot_ids.numel() > 0) {
+    available_mask.index_fill_(0, blocked_slot_ids, false);
+  }
+  auto available_slot_ids = torch::nonzero(available_mask).reshape(-1);
+  TORCH_CHECK(
+      available_slot_ids.size(0) >= count,
+      "No reusable actual block is available; all resident blocks are pinned");
   auto status = torch::zeros(
       {1},
       torch::TensorOptions().device(usage_count.device()).dtype(torch::kInt32));
@@ -442,10 +446,6 @@ torch::Tensor pop_reusable_slots_cuda(
       selected_slot_ids.data_ptr<int64_t>(),
       status.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  TORCH_CHECK(
-      read_status(status) == 0,
-      "No reusable actual block is available; all resident blocks are pinned");
   return selected_slot_ids;
 }
 
@@ -491,8 +491,6 @@ std::vector<torch::Tensor> inspect_load_requests_cuda(
       updated_usage_counts.data_ptr<uint8_t>(),
       status.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  TORCH_CHECK(read_status(status) == 0, "logical block is busy");
   return {current_physical, resident_mask, updated_pin_counts, updated_usage_counts};
 }
 
@@ -528,8 +526,6 @@ std::vector<torch::Tensor> inspect_save_requests_cuda(
       final_usage_counts.data_ptr<uint8_t>(),
       status.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  TORCH_CHECK(read_status(status) == 0, "logical block is busy");
   return {current_physical, existing_mask, final_usage_counts};
 }
 
@@ -635,4 +631,23 @@ void commit_save_metadata_cuda(
       final_usage_counts.data_ptr<uint8_t>(),
       logical_block_ids.numel());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void release_metadata_cuda(
+    torch::Tensor logical_to_physical,
+    torch::Tensor pin_count,
+    torch::Tensor reusable_mask,
+    torch::Tensor logical_block_ids) {
+  check_cuda_tensor(logical_to_physical, torch::kInt64, "logical_to_physical");
+  check_cuda_tensor(pin_count, torch::kInt64, "pin_count");
+  check_cuda_tensor(reusable_mask, torch::kBool, "reusable_mask");
+  check_cuda_tensor(logical_block_ids, torch::kInt64, "logical_block_ids");
+
+  auto physical_slot_ids = logical_to_physical.index_select(0, logical_block_ids);
+  auto updated_pin_counts = pin_count.index_select(0, physical_slot_ids) - 1;
+  pin_count.index_put_({physical_slot_ids}, updated_pin_counts);
+  auto zero_pin_slots = physical_slot_ids.masked_select(updated_pin_counts == 0);
+  if (zero_pin_slots.numel() > 0) {
+    reusable_mask.index_fill_(0, zero_pin_slots, true);
+  }
 }
