@@ -118,6 +118,8 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
     def _build_cmake_extension(self, ext: CMakeExtension) -> None:
         build_root = ROOT_DIR / "build" / ext.name
         install_root = build_root / "install"
+        if build_root.exists():
+            shutil.rmtree(build_root)
         build_root.mkdir(parents=True, exist_ok=True)
         install_root.mkdir(parents=True, exist_ok=True)
 
