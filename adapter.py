@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import os
 import pathlib
 import time
 from dataclasses import dataclass
@@ -11,8 +12,25 @@ from typing import Any, Protocol
 import torch
 
 ID_DTYPE = torch.int64
-USAGE_DTYPE = torch.uint8
-USAGE_COUNT_MAX = 127
+_SLOT_META_BITS = int(os.getenv("KVCA_SLOT_META_BITS", "8"))
+if _SLOT_META_BITS == 8:
+    SLOT_META_DTYPE = torch.uint8
+    PIN_COUNT_BITS = 4
+    USAGE_COUNT_BITS = 4
+elif _SLOT_META_BITS == 16:
+    SLOT_META_DTYPE = torch.uint16
+    PIN_COUNT_BITS = 8
+    USAGE_COUNT_BITS = 8
+else:
+    raise ValueError("KVCA_SLOT_META_BITS must be 8 or 16")
+
+USAGE_DTYPE = SLOT_META_DTYPE
+PIN_COUNT_DTYPE = SLOT_META_DTYPE
+PIN_COUNT_MAX = (1 << PIN_COUNT_BITS) - 1
+USAGE_COUNT_MAX = (1 << USAGE_COUNT_BITS) - 1
+_PIN_COUNT_MASK = PIN_COUNT_MAX
+_USAGE_COUNT_MASK = USAGE_COUNT_MAX
+_USAGE_COUNT_SHIFT = PIN_COUNT_BITS
 
 STATE_FREE = 0
 STATE_RESERVED = 1
@@ -57,6 +75,51 @@ class _EvictionPlan:
     payloads: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _MergedKVBlockLayout:
+    block_shape: torch.Size
+    block_size: int
+    hidden_dim: int
+    token_major: bool
+
+    @classmethod
+    def detect(cls, block_shape: tuple[int, ...] | torch.Size) -> _MergedKVBlockLayout | None:
+        shape = torch.Size(block_shape)
+        if len(shape) != 4:
+            return None
+        if shape[1] == 2:
+            block_size = int(shape[0])
+            hidden_dims = shape[2:]
+            token_major = True
+        elif shape[0] == 2:
+            block_size = int(shape[1])
+            hidden_dims = shape[2:]
+            token_major = False
+        else:
+            return None
+        hidden_dim = 1
+        for dim in hidden_dims:
+            hidden_dim *= int(dim)
+        return cls(
+            block_shape=shape,
+            block_size=block_size,
+            hidden_dim=hidden_dim,
+            token_major=token_major,
+        )
+
+    @property
+    def transfer_shape(self) -> torch.Size:
+        if self.token_major:
+            return torch.Size((self.block_size, 2, self.hidden_dim))
+        return torch.Size((2, self.block_size, self.hidden_dim))
+
+    def flatten_block_batch(self, block_batch: torch.Tensor) -> torch.Tensor:
+        return block_batch.contiguous().view((block_batch.shape[0],) + tuple(self.transfer_shape))
+
+    def restore_block_tensor(self, stored_tensor: torch.Tensor) -> torch.Tensor:
+        return stored_tensor.view(self.block_shape)
+
+
 class KVCacheAdapter:
     """Maps n logical ids onto m resident physical slots in `actual_blocks`.
 
@@ -98,6 +161,7 @@ class KVCacheAdapter:
         self.backend = backend
 
         device = actual_blocks.device
+        self._platform = device.type
         self._logical_to_physical = torch.full(
             (num_logical_blocks,),
             -1,
@@ -110,18 +174,30 @@ class KVCacheAdapter:
             dtype=ID_DTYPE,
             device=device,
         )
-        self._slot_state = torch.full(
-            (num_actual_blocks,),
-            STATE_FREE,
-            dtype=torch.int64,
-            device=device,
-        )
-        self._pin_count = torch.zeros((num_actual_blocks,), dtype=torch.int64, device=device)
-        self._reusable_mask = torch.ones((num_actual_blocks,), dtype=torch.bool, device=device)
-        self._usage_count = torch.zeros((num_actual_blocks,), dtype=USAGE_DTYPE, device=device)
+        self._slot_meta = torch.zeros((num_actual_blocks,), dtype=SLOT_META_DTYPE, device=device)
         self._search_start = torch.zeros((1,), dtype=ID_DTYPE, device=device)
         self._native_ext, self.runtime_path = self._detect_native_extension(
             prefer_native_extension=prefer_native_extension)
+
+    @property
+    def _pin_count(self) -> torch.Tensor:
+        return _slot_meta_pin_counts(self._slot_meta)
+
+    @property
+    def _usage_count(self) -> torch.Tensor:
+        return _slot_meta_usage_counts(self._slot_meta)
+
+    @property
+    def _reusable_mask(self) -> torch.Tensor:
+        return self._pin_count == 0
+
+    @property
+    def _slot_state(self) -> torch.Tensor:
+        return torch.where(
+            self._physical_to_logical >= 0,
+            torch.full_like(self._physical_to_logical, STATE_RESIDENT),
+            torch.full_like(self._physical_to_logical, STATE_FREE),
+        )
 
     def save(self, logical_block_ids: torch.Tensor, block_data: torch.Tensor) -> None:
         _require_id_tensor(logical_block_ids, name="logical_block_ids")
@@ -200,16 +276,14 @@ class KVCacheAdapter:
             dtype=USAGE_DTYPE,
             device=self.actual_blocks.device,
         )
-        touched_slot_ids = torch.cat((hit_slot_ids, miss_physical_slot_ids), dim=0)
-        touched_usage_counts = torch.cat((hit_usage_counts, miss_usage_counts), dim=0)
         self._commit_load_metadata(
             evicted_logical_block_ids=eviction_plan.logical_block_ids,
             miss_logical_block_ids=miss_logical_ids,
             miss_physical_slot_ids=miss_physical_slot_ids,
             hit_slot_ids=hit_slot_ids,
             hit_pin_counts=updated_pin_counts[resident_mask],
-            touched_slot_ids=touched_slot_ids,
-            touched_usage_counts=touched_usage_counts,
+            hit_usage_counts=hit_usage_counts,
+            miss_usage_counts=miss_usage_counts,
         )
         return self._logical_to_physical.index_select(0, logical_block_ids)
 
@@ -221,21 +295,26 @@ class KVCacheAdapter:
             return
 
         if self._native_ext is not None and hasattr(self._native_ext, "release_metadata"):
-            self._native_ext.release_metadata(
-                self._logical_to_physical.contiguous(),
-                self._pin_count.contiguous(),
-                self._reusable_mask.contiguous(),
-                logical_block_ids.contiguous(),
-            )
+            if self._platform == "npu":
+                self._native_ext.release_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._slot_meta.contiguous(),
+                    logical_block_ids.contiguous(),
+                )
+            else:
+                self._native_ext.release_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._pin_count.to(dtype=ID_DTYPE).contiguous(),
+                    self._reusable_mask.contiguous(),
+                    logical_block_ids.contiguous(),
+                )
             return
 
         physical_slot_ids = self._logical_to_physical.index_select(0, logical_block_ids)
         pin_counts = self._pin_count.index_select(0, physical_slot_ids)
         updated_pin_counts = pin_counts - 1
-        self._pin_count.index_put_((physical_slot_ids,), updated_pin_counts)
-        zero_pin_slots = physical_slot_ids[updated_pin_counts == 0]
-        if zero_pin_slots.numel() > 0:
-            self._reusable_mask.index_fill_(0, zero_pin_slots, True)
+        usage_counts = self._usage_count.index_select(0, physical_slot_ids)
+        self._slot_meta.index_put_((physical_slot_ids,), _pack_slot_meta(updated_pin_counts, usage_counts))
 
     def get_actual_block(self, physical_slot_id: int) -> torch.Tensor:
         self._validate_physical_slot_id(physical_slot_id)
@@ -297,11 +376,19 @@ class KVCacheAdapter:
         logical_block_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._native_ext is not None:
+            if self._platform == "npu":
+                return tuple(
+                    self._native_ext.inspect_load_requests(
+                        self._logical_to_physical.contiguous(),
+                        self._slot_meta.contiguous(),
+                        logical_block_ids.contiguous(),
+                    ),
+                )  # type: ignore[return-value]
             return tuple(
                 self._native_ext.inspect_load_requests(
                     self._logical_to_physical.contiguous(),
                     self._slot_state.contiguous(),
-                    self._pin_count.contiguous(),
+                    self._pin_count.to(dtype=ID_DTYPE).contiguous(),
                     self._usage_count.contiguous(),
                     logical_block_ids.contiguous(),
                 ),
@@ -316,12 +403,9 @@ class KVCacheAdapter:
             return current_physical, resident_mask, updated_pin_counts, updated_usage_counts
 
         hit_slot_ids = current_physical[resident_mask]
-        hit_states = self._slot_state.index_select(0, hit_slot_ids)
-        if torch.any(hit_states != STATE_RESIDENT):
-            raise KVCacheAdapterError("logical block is busy")
         hit_pin_counts = self._pin_count.index_select(0, hit_slot_ids) + 1
         hit_usage_counts = _saturating_increment_usage(self._usage_count.index_select(0, hit_slot_ids))
-        updated_pin_counts[resident_mask] = hit_pin_counts
+        updated_pin_counts[resident_mask] = hit_pin_counts.to(dtype=updated_pin_counts.dtype)
         updated_usage_counts[resident_mask] = hit_usage_counts
         return current_physical, resident_mask, updated_pin_counts, updated_usage_counts
 
@@ -330,6 +414,14 @@ class KVCacheAdapter:
         logical_block_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._native_ext is not None:
+            if self._platform == "npu":
+                return tuple(
+                    self._native_ext.inspect_save_requests(
+                        self._logical_to_physical.contiguous(),
+                        self._slot_meta.contiguous(),
+                        logical_block_ids.contiguous(),
+                    ),
+                )  # type: ignore[return-value]
             return tuple(
                 self._native_ext.inspect_save_requests(
                     self._logical_to_physical.contiguous(),
@@ -347,9 +439,6 @@ class KVCacheAdapter:
             return current_physical, existing_mask, final_usage_counts
 
         existing_physical = current_physical[existing_mask]
-        existing_states = self._slot_state.index_select(0, existing_physical)
-        if torch.any(existing_states != STATE_RESIDENT):
-            raise KVCacheAdapterError("logical block is busy")
         final_usage_counts[existing_mask] = _saturating_increment_usage(
             self._usage_count.index_select(0, existing_physical),
         )
@@ -361,6 +450,13 @@ class KVCacheAdapter:
 
         blocked_slot_ids = blocked_slot_ids.contiguous()
         if self._native_ext is not None:
+            if self._platform == "npu":
+                return self._native_ext.pop_reusable_slots(
+                    self._slot_meta.contiguous(),
+                    self._search_start.contiguous(),
+                    blocked_slot_ids,
+                    count,
+                )
             return self._native_ext.pop_reusable_slots(
                 self._usage_count.contiguous(),
                 self._reusable_mask.contiguous(),
@@ -372,31 +468,36 @@ class KVCacheAdapter:
         available_mask = self._reusable_mask.clone()
         if blocked_slot_ids.numel() > 0:
             available_mask.index_fill_(0, blocked_slot_ids, False)
-        available_slot_ids = torch.nonzero(available_mask, as_tuple=False).reshape(-1)
-        if available_slot_ids.numel() < count:
-            raise InsufficientCapacityError("No reusable actual block is available; all resident blocks are pinned")
-
-        available_usage = self._usage_count.index_select(0, available_slot_ids).to(dtype=torch.int64)
-        usage_hist = torch.bincount(available_usage, minlength=USAGE_COUNT_MAX + 1)
-        usage_prefix = torch.cumsum(usage_hist, dim=0)
-        threshold = int(torch.nonzero(usage_prefix >= count, as_tuple=False)[0, 0])
-
         scan_order = (
             self._search_start[0] + torch.arange(self.num_actual_blocks, device=self.actual_blocks.device, dtype=ID_DTYPE)
         ) % self.num_actual_blocks
-        eligible_mask = available_mask.index_select(0, scan_order) & (
-            self._usage_count.index_select(0, scan_order).to(dtype=torch.int64) <= threshold
-        )
-        selected_slot_ids = scan_order[eligible_mask][:count]
-        if selected_slot_ids.numel() != count:
-            raise InsufficientCapacityError("No reusable actual block is available; all resident blocks are pinned")
-
-        if threshold > 0:
-            self._usage_count.copy_(
-                torch.clamp(self._usage_count.to(dtype=torch.int16) - threshold, min=0).to(dtype=USAGE_DTYPE),
-            )
-        self._search_start[0] = (selected_slot_ids[-1] + 1) % self.num_actual_blocks
-        return selected_slot_ids
+        scan_available = available_mask.index_select(0, scan_order)
+        scan_usage = self._usage_count.index_select(0, scan_order)
+        selected_parts: list[torch.Tensor] = []
+        selected_count = 0
+        selected_threshold = 0
+        for threshold in range(USAGE_COUNT_MAX + 1):
+            threshold_slots = scan_order[scan_available & (scan_usage == threshold)]
+            if threshold_slots.numel() == 0:
+                continue
+            remaining = count - selected_count
+            chosen = threshold_slots[:remaining]
+            if chosen.numel() == 0:
+                continue
+            selected_parts.append(chosen)
+            selected_count += int(chosen.numel())
+            selected_threshold = threshold
+            if selected_count == count:
+                selected_slot_ids = torch.cat(selected_parts, dim=0)
+                if selected_threshold > 0:
+                    aged_usage = torch.clamp(
+                        self._usage_count.to(dtype=torch.int32) - selected_threshold,
+                        min=0,
+                    ).to(dtype=USAGE_DTYPE)
+                    self._slot_meta.copy_(_pack_slot_meta(self._pin_count, aged_usage))
+                self._search_start[0] = (selected_slot_ids[-1] + 1) % self.num_actual_blocks
+                return selected_slot_ids
+        raise InsufficientCapacityError("No reusable actual block is available; all resident blocks are pinned")
 
     def _build_eviction_plan(
         self,
@@ -407,10 +508,8 @@ class KVCacheAdapter:
             return _EvictionPlan(logical_block_ids[:0], self.actual_blocks[:0])
 
         previous_logical_ids = self._physical_to_logical.index_select(0, physical_slot_ids)
-        previous_states = self._slot_state.index_select(0, physical_slot_ids)
         eviction_mask = (
-            (previous_states == STATE_RESIDENT)
-            & (previous_logical_ids >= 0)
+            (previous_logical_ids >= 0)
             & (previous_logical_ids != logical_block_ids)
         )
         if not torch.any(eviction_mask):
@@ -429,29 +528,45 @@ class KVCacheAdapter:
         miss_physical_slot_ids: torch.Tensor,
         hit_slot_ids: torch.Tensor,
         hit_pin_counts: torch.Tensor,
-        touched_slot_ids: torch.Tensor,
-        touched_usage_counts: torch.Tensor,
+        hit_usage_counts: torch.Tensor,
+        miss_usage_counts: torch.Tensor,
     ) -> None:
-        empty_ids = self._logical_to_physical[:0]
-        empty_usage = self._usage_count[:0]
         if self._native_ext is not None:
-            self._native_ext.commit_load_metadata(
-                self._logical_to_physical.contiguous(),
-                self._physical_to_logical.contiguous(),
-                self._slot_state.contiguous(),
-                self._pin_count.contiguous(),
-                self._reusable_mask.contiguous(),
-                self._usage_count.contiguous(),
-                evicted_logical_block_ids.contiguous(),
-                empty_ids.contiguous(),
-                empty_usage.contiguous(),
-                miss_logical_block_ids.contiguous(),
-                miss_physical_slot_ids.contiguous(),
-                hit_slot_ids.contiguous(),
-                hit_pin_counts.contiguous(),
-                touched_slot_ids.contiguous(),
-                touched_usage_counts.contiguous(),
-            )
+            if self._platform == "npu":
+                self._native_ext.commit_load_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._physical_to_logical.contiguous(),
+                    self._slot_meta.contiguous(),
+                    evicted_logical_block_ids.contiguous(),
+                    miss_logical_block_ids.contiguous(),
+                    miss_physical_slot_ids.contiguous(),
+                    hit_slot_ids.contiguous(),
+                    hit_pin_counts.contiguous(),
+                    hit_usage_counts.contiguous(),
+                    miss_usage_counts.contiguous(),
+                )
+            else:
+                touched_slot_ids = torch.cat((hit_slot_ids, miss_physical_slot_ids), dim=0)
+                touched_usage_counts = torch.cat((hit_usage_counts, miss_usage_counts), dim=0)
+                empty_ids = self._logical_to_physical[:0]
+                empty_usage = self._usage_count[:0]
+                self._native_ext.commit_load_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._physical_to_logical.contiguous(),
+                    self._slot_state.contiguous(),
+                    self._pin_count.to(dtype=ID_DTYPE).contiguous(),
+                    self._reusable_mask.contiguous(),
+                    self._usage_count.contiguous(),
+                    evicted_logical_block_ids.contiguous(),
+                    empty_ids.contiguous(),
+                    empty_usage.contiguous(),
+                    miss_logical_block_ids.contiguous(),
+                    miss_physical_slot_ids.contiguous(),
+                    hit_slot_ids.contiguous(),
+                    hit_pin_counts.to(dtype=ID_DTYPE).contiguous(),
+                    touched_slot_ids.contiguous(),
+                    touched_usage_counts.contiguous(),
+                )
             return
 
         if evicted_logical_block_ids.numel() > 0:
@@ -459,13 +574,11 @@ class KVCacheAdapter:
         if miss_logical_block_ids.numel() > 0:
             self._logical_to_physical.index_put_((miss_logical_block_ids,), miss_physical_slot_ids)
             self._physical_to_logical.index_put_((miss_physical_slot_ids,), miss_logical_block_ids)
-            self._slot_state.index_fill_(0, miss_physical_slot_ids, STATE_RESIDENT)
-            self._pin_count.index_fill_(0, miss_physical_slot_ids, 1)
         if hit_slot_ids.numel() > 0:
-            self._pin_count.index_put_((hit_slot_ids,), hit_pin_counts)
-        if touched_slot_ids.numel() > 0:
-            self._reusable_mask.index_fill_(0, touched_slot_ids, False)
-            self._usage_count.index_put_((touched_slot_ids,), touched_usage_counts)
+            self._slot_meta.index_put_((hit_slot_ids,), _pack_slot_meta(hit_pin_counts, hit_usage_counts))
+        if miss_physical_slot_ids.numel() > 0:
+            miss_pin_counts = torch.ones_like(miss_physical_slot_ids, dtype=PIN_COUNT_DTYPE)
+            self._slot_meta.index_put_((miss_physical_slot_ids,), _pack_slot_meta(miss_pin_counts, miss_usage_counts))
 
     def _commit_save_metadata(
         self,
@@ -476,34 +589,43 @@ class KVCacheAdapter:
         final_pin_counts: torch.Tensor,
         final_usage_counts: torch.Tensor,
     ) -> None:
-        empty_ids = self._logical_to_physical[:0]
-        empty_usage = self._usage_count[:0]
         if self._native_ext is not None:
-            self._native_ext.commit_save_metadata(
-                self._logical_to_physical.contiguous(),
-                self._physical_to_logical.contiguous(),
-                self._slot_state.contiguous(),
-                self._pin_count.contiguous(),
-                self._reusable_mask.contiguous(),
-                self._usage_count.contiguous(),
-                evicted_logical_block_ids.contiguous(),
-                empty_ids.contiguous(),
-                empty_usage.contiguous(),
-                logical_block_ids.contiguous(),
-                physical_slot_ids.contiguous(),
-                final_pin_counts.contiguous(),
-                final_usage_counts.contiguous(),
-            )
+            if self._platform == "npu":
+                self._native_ext.commit_save_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._physical_to_logical.contiguous(),
+                    self._slot_meta.contiguous(),
+                    evicted_logical_block_ids.contiguous(),
+                    logical_block_ids.contiguous(),
+                    physical_slot_ids.contiguous(),
+                    final_pin_counts.contiguous(),
+                    final_usage_counts.contiguous(),
+                )
+            else:
+                empty_ids = self._logical_to_physical[:0]
+                empty_usage = self._usage_count[:0]
+                self._native_ext.commit_save_metadata(
+                    self._logical_to_physical.contiguous(),
+                    self._physical_to_logical.contiguous(),
+                    self._slot_state.contiguous(),
+                    self._pin_count.to(dtype=ID_DTYPE).contiguous(),
+                    self._reusable_mask.contiguous(),
+                    self._usage_count.contiguous(),
+                    evicted_logical_block_ids.contiguous(),
+                    empty_ids.contiguous(),
+                    empty_usage.contiguous(),
+                    logical_block_ids.contiguous(),
+                    physical_slot_ids.contiguous(),
+                    final_pin_counts.to(dtype=ID_DTYPE).contiguous(),
+                    final_usage_counts.contiguous(),
+                )
             return
 
         if evicted_logical_block_ids.numel() > 0:
             self._logical_to_physical.index_fill_(0, evicted_logical_block_ids, -1)
         self._logical_to_physical.index_put_((logical_block_ids,), physical_slot_ids)
         self._physical_to_logical.index_put_((physical_slot_ids,), logical_block_ids)
-        self._slot_state.index_fill_(0, physical_slot_ids, STATE_RESIDENT)
-        self._pin_count.index_put_((physical_slot_ids,), final_pin_counts)
-        self._usage_count.index_put_((physical_slot_ids,), final_usage_counts)
-        self._reusable_mask.index_put_((physical_slot_ids,), final_pin_counts == 0)
+        self._slot_meta.index_put_((physical_slot_ids,), _pack_slot_meta(final_pin_counts, final_usage_counts))
 
     def _copy_into_actual_blocks(self, physical_slot_ids: torch.Tensor, block_data: torch.Tensor) -> None:
         if physical_slot_ids.numel() == 0:
@@ -700,25 +822,37 @@ class LMCacheBackend:
         max_local_cpu_size_gb: float = 1.0,
         lmcache_instance_id: str | None = None,
     ) -> None:
-        _ensure_lmcache_c_ops_ready()
+        _maybe_enable_lmcache_ascend()
         from lmcache.utils import CacheEngineKey
-        from lmcache.v1.gpu_connector.gpu_ops import lmcache_memcpy_async_d2h, lmcache_memcpy_async_h2d
         from lmcache.v1.config import LMCacheEngineConfig
-        from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj
+        from lmcache.v1.memory_management import (
+            MemoryFormat,
+            MemoryObjMetadata,
+            PinMemoryAllocator,
+            TensorMemoryObj,
+        )
         from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
         self._CacheEngineKey = CacheEngineKey
-        self._lmcache_memcpy_async_d2h = lmcache_memcpy_async_d2h
-        self._lmcache_memcpy_async_h2d = lmcache_memcpy_async_h2d
+        self._lmcache_memcpy_async_d2h: Any | None = None
+        self._lmcache_memcpy_async_h2d: Any | None = None
         self._MemoryFormat = MemoryFormat
         self._MemoryObjMetadata = MemoryObjMetadata
+        self._PinMemoryAllocator = PinMemoryAllocator
         self._TensorMemoryObj = TensorMemoryObj
         self._block_shape = torch.Size(block_shape)
         self._block_dtype = block_dtype
         self._model_name = model_name
         self._world_size = world_size
         self._worker_id = worker_id
+        self._pin_allocator: Any | None = None
+        self._pin_allocator_size_bytes = max(1, int(max_local_cpu_size_gb * (1024**3)))
         self._prefer_pinned_host = torch.cuda.is_available()
+        self._npu_fused_transfer = _NPUFusedBlockTransfer(
+            block_shape=self._block_shape,
+            block_dtype=self._block_dtype,
+            memory_format_enum=self._MemoryFormat,
+        )
         self._config = LMCacheEngineConfig(
             local_cpu=True,
             max_local_cpu_size=max_local_cpu_size_gb,
@@ -740,10 +874,14 @@ class LMCacheBackend:
         keys = self._make_keys(logical_block_ids_cpu)
         memory_objs = self._make_memory_objs_from_payloads(block_data)
         self._backend.batched_remove(keys)
-        self._backend.batched_submit_put_task(
-            keys,
-            memory_objs,
-        )
+        try:
+            self._backend.batched_submit_put_task(
+                keys,
+                memory_objs,
+            )
+        finally:
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
 
     def load_blocks(
         self,
@@ -770,10 +908,16 @@ class LMCacheBackend:
                 if physical_slot_ids.device == actual_blocks.device
                 else physical_slot_ids.to(device=actual_blocks.device)
             )
+            if self._npu_fused_transfer.can_load_into(actual_blocks) and self._npu_fused_transfer.can_consume_memory_objs(memory_objs):
+                self._npu_fused_transfer.load_into_actual_blocks(
+                    memory_objs=memory_objs,
+                    actual_blocks=actual_blocks,
+                    physical_slot_ids=physical_slot_ids_device,
+                )
+                return
             if actual_blocks.device.type == "cpu":
-                loaded_payloads_cpu = torch.stack(
+                loaded_payloads_cpu = self._stack_payload_tensors(
                     [memory_obj.tensor for memory_obj in memory_objs if memory_obj is not None],
-                    dim=0,
                 )
                 actual_blocks.index_copy_(
                     0,
@@ -782,6 +926,15 @@ class LMCacheBackend:
                 )
                 return
 
+            if actual_blocks.device.type in {"npu", "privateuseone"}:
+                self._load_blocks_generic_accelerator(
+                    memory_objs=memory_objs,
+                    actual_blocks=actual_blocks,
+                    physical_slot_ids=physical_slot_ids_device,
+                )
+                return
+
+            self._ensure_cuda_memcpy_ops_loaded()
             for memory_obj, physical_slot_id in zip(memory_objs, self._logical_ids_to_cpu(physical_slot_ids), strict=False):
                 self._lmcache_memcpy_async_h2d(
                     memory_obj,
@@ -796,6 +949,9 @@ class LMCacheBackend:
     def shutdown(self) -> None:
         self._backend.clear()
         self._backend.close()
+        if self._pin_allocator is not None:
+            self._pin_allocator.close()
+            self._pin_allocator = None
 
     def _make_keys(self, logical_block_ids: torch.Tensor) -> list[object]:
         return [
@@ -819,6 +975,50 @@ class LMCacheBackend:
             payloads_cpu = block_data.detach().contiguous()
             return [self._make_memory_obj(payload) for payload in payloads_cpu.unbind(0)]
 
+        if self._npu_fused_transfer.can_save_from(block_data):
+            pinned_memory_objs = self._allocate_pinned_memory_objs(
+                batch_size=block_data.shape[0],
+                payload_shape=self._npu_fused_transfer.transfer_shape,
+                payload_dtype=block_data.dtype,
+                memory_format=self._npu_fused_transfer.memory_format,
+            )
+            if pinned_memory_objs is None:
+                raise RuntimeError("NPU fused transfer requires pinned host allocation")
+            try:
+                self._npu_fused_transfer.save_from_block_data(
+                    block_data=block_data,
+                    memory_objs=pinned_memory_objs,
+                )
+                return pinned_memory_objs
+            except Exception:
+                if self._pin_allocator is not None:
+                    self._pin_allocator.batched_free(pinned_memory_objs)
+                raise
+
+        pinned_memory_objs = self._allocate_pinned_memory_objs(
+            batch_size=block_data.shape[0],
+            payload_shape=torch.Size(block_data.shape[1:]),
+            payload_dtype=block_data.dtype,
+            memory_format=self._MemoryFormat.UNDEFINED,
+        )
+        if pinned_memory_objs is not None:
+            try:
+                if block_data.device.type in {"npu", "privateuseone"}:
+                    self._save_blocks_generic_accelerator(
+                        block_data=block_data,
+                        memory_objs=pinned_memory_objs,
+                    )
+                else:
+                    self._ensure_cuda_memcpy_ops_loaded()
+                    for source_payload, memory_obj in zip(block_data.detach().unbind(0), pinned_memory_objs, strict=False):
+                        self._lmcache_memcpy_async_d2h(source_payload, memory_obj)
+                _synchronize_device(block_data.device)
+                return pinned_memory_objs
+            except Exception:
+                if self._pin_allocator is not None:
+                    self._pin_allocator.batched_free(pinned_memory_objs)
+                raise
+
         payloads_cpu = torch.empty(
             block_data.shape,
             dtype=block_data.dtype,
@@ -826,10 +1026,79 @@ class LMCacheBackend:
             pin_memory=self._prefer_pinned_host and block_data.device.type == "cuda",
         )
         memory_objs = [self._make_memory_obj(payload) for payload in payloads_cpu.unbind(0)]
-        for source_payload, memory_obj in zip(block_data.detach().unbind(0), memory_objs, strict=False):
-            self._lmcache_memcpy_async_d2h(source_payload, memory_obj)
+        if block_data.device.type in {"npu", "privateuseone"}:
+            self._save_blocks_generic_accelerator(
+                block_data=block_data,
+                memory_objs=memory_objs,
+            )
+        else:
+            self._ensure_cuda_memcpy_ops_loaded()
+            for source_payload, memory_obj in zip(block_data.detach().unbind(0), memory_objs, strict=False):
+                self._lmcache_memcpy_async_d2h(source_payload, memory_obj)
         _synchronize_device(block_data.device)
         return memory_objs
+
+    def _allocate_pinned_memory_objs(
+        self,
+        *,
+        batch_size: int,
+        payload_shape: torch.Size,
+        payload_dtype: torch.dtype,
+        memory_format: object,
+    ) -> list[object] | None:
+        if batch_size == 0:
+            return []
+        if not self._supports_pinned_host_allocator():
+            return None
+        if self._pin_allocator is None:
+            self._pin_allocator = self._PinMemoryAllocator(self._pin_allocator_size_bytes)
+        return self._pin_allocator.batched_allocate(
+            payload_shape,
+            payload_dtype,
+            batch_size,
+            memory_format,
+        )
+
+    def _supports_pinned_host_allocator(self) -> bool:
+        return torch.cuda.is_available() or hasattr(torch, "npu")
+
+    def _ensure_cuda_memcpy_ops_loaded(self) -> None:
+        if self._lmcache_memcpy_async_d2h is not None and self._lmcache_memcpy_async_h2d is not None:
+            return
+        _ensure_lmcache_c_ops_ready()
+        memcpy_d2h, memcpy_h2d = _load_lmcache_cuda_memcpy_ops()
+        self._lmcache_memcpy_async_d2h = memcpy_d2h
+        self._lmcache_memcpy_async_h2d = memcpy_h2d
+
+    def _save_blocks_generic_accelerator(
+        self,
+        *,
+        block_data: torch.Tensor,
+        memory_objs: list[object],
+    ) -> None:
+        for source_payload, memory_obj in zip(block_data.detach().unbind(0), memory_objs, strict=False):
+            memory_obj.tensor.copy_(source_payload, non_blocking=True)
+
+    def _load_blocks_generic_accelerator(
+        self,
+        *,
+        memory_objs: list[object],
+        actual_blocks: torch.Tensor,
+        physical_slot_ids: torch.Tensor,
+    ) -> None:
+        loaded_payloads_cpu = self._stack_payload_tensors(
+            [memory_obj.tensor for memory_obj in memory_objs if memory_obj is not None],
+        )
+        loaded_payloads_device = loaded_payloads_cpu.to(
+            device=actual_blocks.device,
+            dtype=actual_blocks.dtype,
+        )
+        actual_blocks.index_copy_(
+            0,
+            physical_slot_ids,
+            loaded_payloads_device,
+        )
+        _synchronize_device(actual_blocks.device)
 
     def _make_memory_obj(self, payload: torch.Tensor) -> object:
         payload = payload.contiguous()
@@ -855,6 +1124,177 @@ class LMCacheBackend:
             raise TypeError(f"{name} must have dtype {self._block_dtype}")
         if tuple(block_data.shape[1:]) != tuple(self._block_shape):
             raise ValueError(f"{name} must have trailing shape {tuple(self._block_shape)}")
+
+    def _stack_payload_tensors(self, payload_tensors: list[torch.Tensor]) -> torch.Tensor:
+        if self._npu_fused_transfer.layout is None:
+            return torch.stack(payload_tensors, dim=0)
+        restored = [self._npu_fused_transfer.restore_stored_tensor(tensor) for tensor in payload_tensors]
+        return torch.stack(restored, dim=0)
+
+
+class _NPUFusedBlockTransfer:
+    def __init__(
+        self,
+        *,
+        block_shape: torch.Size,
+        block_dtype: torch.dtype,
+        memory_format_enum: Any,
+    ) -> None:
+        self.layout = _MergedKVBlockLayout.detect(block_shape)
+        self._block_dtype = block_dtype
+        self._MemoryFormat = memory_format_enum
+        self._c_ops: Any | None = None
+        self._staging_cache: torch.Tensor | None = None
+        self._staging_capacity_tokens = 0
+        self._staging_device: torch.device | None = None
+        if self.layout is None:
+            return
+        try:
+            self._c_ops = importlib.import_module("lmcache_ascend.c_ops")
+        except Exception:
+            self._c_ops = None
+
+    @property
+    def transfer_shape(self) -> torch.Size:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        return self.layout.transfer_shape
+
+    @property
+    def memory_format(self) -> object:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        if self.layout.token_major:
+            return self._MemoryFormat.KV_2TD
+        return self._MemoryFormat.KV_T2D
+
+    def can_save_from(self, block_data: torch.Tensor) -> bool:
+        return self._can_run_on(block_data.device) and tuple(block_data.shape[1:]) == tuple(self.layout.block_shape)
+
+    def can_load_into(self, actual_blocks: torch.Tensor) -> bool:
+        return self._can_run_on(actual_blocks.device) and tuple(actual_blocks.shape[1:]) == tuple(self.layout.block_shape)
+
+    def save_from_block_data(
+        self,
+        *,
+        block_data: torch.Tensor,
+        memory_objs: list[object],
+    ) -> None:
+        if self.layout is None or self._c_ops is None:
+            raise RuntimeError("NPU fused transfer is unavailable")
+        self._c_ops.batched_fused_single_layer_kv_transfer(
+            [memory_obj.tensor for memory_obj in memory_objs],
+            self._get_staging_cache(block_data.device, block_data.shape[0]),
+            block_data.contiguous(),
+            self._dense_slot_mapping(block_data.shape[0], device=block_data.device),
+            self._chunk_offsets(block_data.shape[0]),
+            self._chunk_sizes(block_data.shape[0]),
+            True,
+            1,
+            self.layout.token_major,
+            False,
+        )
+        _synchronize_device(block_data.device)
+
+    def load_into_actual_blocks(
+        self,
+        *,
+        memory_objs: list[object],
+        actual_blocks: torch.Tensor,
+        physical_slot_ids: torch.Tensor,
+    ) -> None:
+        if self.layout is None or self._c_ops is None:
+            raise RuntimeError("NPU fused transfer is unavailable")
+        self._c_ops.batched_fused_single_layer_kv_transfer(
+            [memory_obj.tensor for memory_obj in memory_objs if memory_obj is not None],
+            self._get_staging_cache(actual_blocks.device, physical_slot_ids.shape[0]),
+            actual_blocks,
+            self._physical_slot_mapping(physical_slot_ids.contiguous()),
+            self._chunk_offsets(physical_slot_ids.shape[0]),
+            self._chunk_sizes(physical_slot_ids.shape[0]),
+            False,
+            1,
+            self.layout.token_major,
+            False,
+        )
+        _synchronize_device(actual_blocks.device)
+
+    def restore_stored_tensor(self, stored_tensor: torch.Tensor) -> torch.Tensor:
+        if self.layout is None:
+            return stored_tensor
+        if tuple(stored_tensor.shape) == tuple(self.layout.transfer_shape):
+            return self.layout.restore_block_tensor(stored_tensor)
+        return stored_tensor
+
+    def can_consume_memory_objs(self, memory_objs: list[object]) -> bool:
+        if self.layout is None:
+            return False
+        expected_shape = tuple(self.layout.transfer_shape)
+        return all(
+            memory_obj is not None
+            and getattr(memory_obj, "tensor", None) is not None
+            and tuple(memory_obj.tensor.shape) == expected_shape
+            for memory_obj in memory_objs
+        )
+
+    def _can_run_on(self, device: torch.device) -> bool:
+        return self.layout is not None and self._c_ops is not None and device.type in {"npu", "privateuseone"}
+
+    def _dense_slot_mapping(self, num_blocks: int, *, device: torch.device) -> torch.Tensor:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        return torch.arange(
+            num_blocks * self.layout.block_size,
+            dtype=ID_DTYPE,
+            device=device,
+        )
+
+    def _physical_slot_mapping(self, physical_slot_ids: torch.Tensor) -> torch.Tensor:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        token_offsets = torch.arange(
+            self.layout.block_size,
+            dtype=ID_DTYPE,
+            device=physical_slot_ids.device,
+        )
+        return (
+            physical_slot_ids.reshape(-1, 1) * self.layout.block_size + token_offsets.reshape(1, -1)
+        ).reshape(-1)
+
+    def _chunk_offsets(self, num_blocks: int) -> list[int]:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        return [block_index * self.layout.block_size for block_index in range(num_blocks)]
+
+    def _chunk_sizes(self, num_blocks: int) -> list[int]:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        return [self.layout.block_size] * num_blocks
+
+    def _get_staging_cache(self, device: torch.device, num_blocks: int) -> torch.Tensor:
+        if self.layout is None:
+            raise RuntimeError("NPU fused transfer layout is unavailable")
+        required_tokens = num_blocks * self.layout.block_size
+        if (
+            self._staging_cache is None
+            or self._staging_device != device
+            or self._staging_capacity_tokens < required_tokens
+        ):
+            full_shape = (
+                (required_tokens, 2, self.layout.hidden_dim)
+                if self.layout.token_major
+                else (2, required_tokens, self.layout.hidden_dim)
+            )
+            self._staging_cache = torch.empty(
+                full_shape,
+                dtype=self._block_dtype,
+                device=device,
+            )
+            self._staging_capacity_tokens = required_tokens
+            self._staging_device = device
+        if self.layout.token_major:
+            return self._staging_cache[:required_tokens]
+        return self._staging_cache[:, :required_tokens]
 
 
 class _NoopMemoryAllocator:
@@ -892,14 +1332,36 @@ def _load_cuda_extension_module() -> Any | None:
 @lru_cache(maxsize=1)
 def _load_npu_extension_module() -> Any | None:
     try:
-        return importlib.import_module("kv_cache_adapter_npu")
+        return importlib.import_module("kv_cache_adapter_npu_custom")
     except Exception:
         return None
 
 
+@lru_cache(maxsize=1)
+def _load_lmcache_cuda_memcpy_ops() -> tuple[Any, Any]:
+    gpu_ops = importlib.import_module("lmcache.v1.gpu_connector.gpu_ops")
+    return gpu_ops.lmcache_memcpy_async_d2h, gpu_ops.lmcache_memcpy_async_h2d
+
+
 def _saturating_increment_usage(values: torch.Tensor) -> torch.Tensor:
-    incremented = values.to(dtype=torch.int16) + 1
+    incremented = values.to(dtype=torch.int32) + 1
     return torch.clamp(incremented, max=USAGE_COUNT_MAX).to(dtype=USAGE_DTYPE)
+
+
+def _slot_meta_pin_counts(slot_meta: torch.Tensor) -> torch.Tensor:
+    return (slot_meta.to(dtype=torch.int32) & _PIN_COUNT_MASK).to(dtype=PIN_COUNT_DTYPE)
+
+
+def _slot_meta_usage_counts(slot_meta: torch.Tensor) -> torch.Tensor:
+    return ((slot_meta.to(dtype=torch.int32) >> _USAGE_COUNT_SHIFT) & _USAGE_COUNT_MASK).to(dtype=USAGE_DTYPE)
+
+
+def _pack_slot_meta(pin_counts: torch.Tensor, usage_counts: torch.Tensor) -> torch.Tensor:
+    packed = (
+        (pin_counts.to(dtype=torch.int32) & _PIN_COUNT_MASK)
+        | ((usage_counts.to(dtype=torch.int32) & _USAGE_COUNT_MASK) << _USAGE_COUNT_SHIFT)
+    )
+    return packed.to(dtype=SLOT_META_DTYPE)
 
 
 def _require_id_tensor(values: torch.Tensor, *, name: str) -> None:
@@ -940,6 +1402,16 @@ def _synchronize_device(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type in {"npu", "privateuseone"} and hasattr(torch, "npu"):
         torch.npu.synchronize()
+
+
+@lru_cache(maxsize=1)
+def _maybe_enable_lmcache_ascend() -> None:
+    if not hasattr(torch, "npu"):
+        return
+    try:
+        importlib.import_module("lmcache_ascend")
+    except Exception:
+        return
 
 
 @lru_cache(maxsize=1)

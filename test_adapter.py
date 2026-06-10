@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import importlib.util
+import pathlib
+import types
+
 import pytest
 import torch
 
 from kv_cache_adapter.benchmark_lmcache_backend import BenchmarkConfig, run_benchmark
+from kv_cache_adapter import adapter as adapter_module
+from kv_cache_adapter.adapter import _MergedKVBlockLayout
 from kv_cache_adapter import (
     BlockNotFoundError,
     InMemoryBlockStoreBackend,
@@ -419,3 +425,125 @@ def test_lmcache_benchmark_smoke() -> None:
         assert result.avg_load_ms >= 0.0
         assert result.avg_save_ms >= 0.0
         assert result.total_seconds >= 0.0
+
+
+@pytest.mark.parametrize(
+    ("block_shape", "expected_transfer_shape"),
+    [
+        ((16, 2, 4, 8), (16, 2, 32)),
+        ((2, 16, 4, 8), (2, 16, 32)),
+    ],
+)
+def test_merged_kv_block_layout_round_trips(block_shape: tuple[int, ...], expected_transfer_shape: tuple[int, ...]) -> None:
+    layout = _MergedKVBlockLayout.detect(block_shape)
+
+    assert layout is not None
+    assert tuple(layout.transfer_shape) == expected_transfer_shape
+
+    payload = torch.arange(1, 1 + int(torch.tensor(block_shape).prod().item()), dtype=torch.float32).view(block_shape)
+    flattened = layout.flatten_block_batch(payload.unsqueeze(0))
+
+    assert tuple(flattened.shape[1:]) == expected_transfer_shape
+    assert torch.equal(layout.restore_block_tensor(flattened[0]), payload)
+
+
+def test_lmcache_backend_cpu_load_restores_flattened_merged_kv_payload() -> None:
+    pytest.importorskip("lmcache")
+    block_shape = (2, 4, 2, 3)
+    layout = _MergedKVBlockLayout.detect(block_shape)
+    assert layout is not None
+
+    backend = LMCacheBackend(
+        block_shape=block_shape,
+        block_dtype=torch.float32,
+        max_local_cpu_size_gb=0.01,
+    )
+    payload = torch.arange(1, 1 + 2 * 4 * 2 * 3, dtype=torch.float32).view(block_shape)
+    flattened_payload = layout.flatten_block_batch(payload.unsqueeze(0))[0].contiguous()
+    memory_obj = backend._make_memory_obj(flattened_payload)  # type: ignore[attr-defined]
+    key = backend._make_keys(torch.tensor([7], dtype=torch.int64))[0]  # type: ignore[attr-defined]
+    backend._backend.submit_put_task(key, memory_obj)  # type: ignore[attr-defined]
+    memory_obj.ref_count_down()
+
+    actual_blocks = torch.zeros((1,) + block_shape, dtype=torch.float32)
+    backend.load_blocks(
+        torch.tensor([7], dtype=torch.int64),
+        actual_blocks,
+        torch.tensor([0], dtype=torch.int64),
+    )
+
+    assert torch.equal(actual_blocks[0], payload)
+    backend.shutdown()
+
+
+def test_lmcache_backend_init_does_not_import_gpu_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("lmcache")
+    imported_modules: list[str] = []
+    real_import = adapter_module.importlib.import_module
+
+    def guarded_import(name: str, package: str | None = None) -> object:
+        imported_modules.append(name)
+        if name == "lmcache.v1.gpu_connector.gpu_ops":
+            raise AssertionError("LMCacheBackend init unexpectedly imported GPU-only ops")
+        return real_import(name, package)
+
+    monkeypatch.setattr(adapter_module.importlib, "import_module", guarded_import)
+
+    backend = LMCacheBackend(
+        block_shape=(64,),
+        block_dtype=torch.float16,
+        max_local_cpu_size_gb=0.01,
+    )
+
+    backend.shutdown()
+    assert "lmcache.v1.gpu_connector.gpu_ops" not in imported_modules
+
+
+def test_load_npu_extension_prefers_custom_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    custom_module = object()
+    legacy_module = object()
+
+    def fake_import(name: str, package: str | None = None) -> object:
+        del package
+        if name == "kv_cache_adapter_npu_custom":
+            return custom_module
+        if name == "kv_cache_adapter_npu":
+            return legacy_module
+        raise ImportError(name)
+
+    adapter_module._load_npu_extension_module.cache_clear()
+    monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
+
+    assert adapter_module._load_npu_extension_module() is custom_module
+
+
+def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
+    imported_modules: list[str] = []
+    standalone_ops = types.SimpleNamespace(
+        inspect_load_requests=lambda *args: ("inspect_load_requests", args),
+        inspect_save_requests=lambda *args: ("inspect_save_requests", args),
+        pop_reusable_slots=lambda *args: ("pop_reusable_slots", args),
+        commit_load_metadata=lambda *args: ("commit_load_metadata", args),
+        commit_save_metadata=lambda *args: ("commit_save_metadata", args),
+        release_metadata=lambda *args: ("release_metadata", args),
+    )
+
+    real_import = adapter_module.importlib.import_module
+
+    def fake_import(name: str, package: str | None = None) -> object:
+        del package
+        imported_modules.append(name)
+        if name == "kv_cache_adapter_npu_custom_ops":
+            return standalone_ops
+        return real_import(name)
+
+    monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
+    spec = importlib.util.spec_from_file_location("kv_cache_adapter_npu_custom_test", wrapper_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.inspect_load_requests(1, 2) == ("inspect_load_requests", (1, 2))
+    assert "lmcache_ascend.c_ops" not in imported_modules

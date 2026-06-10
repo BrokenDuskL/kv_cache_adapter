@@ -7,9 +7,9 @@ from dataclasses import dataclass
 import torch
 
 if __package__ in (None, ""):
-    from adapter import KVCacheAdapter, LMCacheBackend, STATE_RESIDENT
+    from adapter import KVCacheAdapter, LMCacheBackend, STATE_RESIDENT, _load_cuda_extension_module, _load_npu_extension_module
 else:
-    from .adapter import KVCacheAdapter, LMCacheBackend, STATE_RESIDENT
+    from .adapter import KVCacheAdapter, LMCacheBackend, STATE_RESIDENT, _load_cuda_extension_module, _load_npu_extension_module
 
 
 @dataclass(frozen=True)
@@ -325,9 +325,9 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _benchmark_device() -> torch.device:
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and _load_cuda_extension_module() is not None:
         return torch.device("cuda")
-    if hasattr(torch, "npu") and torch.npu.is_available():
+    if hasattr(torch, "npu") and torch.npu.is_available() and _load_npu_extension_module() is not None:
         return torch.device("npu")
     return torch.device("cpu")
 

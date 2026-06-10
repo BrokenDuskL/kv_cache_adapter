@@ -113,14 +113,18 @@ def benchmark_runtime_path(
     config: BenchmarkConfig,
     *,
     device: torch.device,
+    force_strict: bool = False,
 ) -> tuple[str, list[tuple[float, float, float]]]:
     all_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
     generator = torch.Generator(device="cpu")
     generator.manual_seed(config.seed)
+    original_detect = KVCacheAdapter._detect_native_extension
+    if force_strict:
+        KVCacheAdapter._detect_native_extension = _force_strict_runtime  # type: ignore[assignment]
     adapter = make_adapter(
         config,
         device=device,
-        prefer_native_extension=True,
+        prefer_native_extension=not force_strict,
     )
     results: list[tuple[float, float, float]] = []
     try:
@@ -167,7 +171,17 @@ def benchmark_runtime_path(
         return adapter.runtime_path, results
     finally:
         adapter.shutdown()
+        KVCacheAdapter._detect_native_extension = original_detect
         synchronize(device)
+
+
+def _force_strict_runtime(
+    self: KVCacheAdapter,
+    *,
+    prefer_native_extension: bool,
+) -> tuple[None, str]:
+    del self, prefer_native_extension
+    return None, "strict"
 
 
 def parse_args() -> argparse.Namespace:
@@ -199,6 +213,11 @@ def main() -> None:
         block_size=args.block_size,
         seed=args.seed,
     )
+    strict_runtime, strict_results = benchmark_runtime_path(
+        config,
+        device=device,
+        force_strict=True,
+    )
     runtime_path, results = benchmark_runtime_path(
         config,
         device=device,
@@ -206,6 +225,8 @@ def main() -> None:
 
     print("runtime | hit_rate | avg_load_ms | avg_save_ms")
     print("--- | --- | --- | ---")
+    for hit_rate, load_ms, save_ms in strict_results:
+        print(f"{strict_runtime} | {hit_rate:.1f} | {load_ms:.3f} | {save_ms:.3f}")
     for hit_rate, load_ms, save_ms in results:
         print(f"{runtime_path} | {hit_rate:.1f} | {load_ms:.3f} | {save_ms:.3f}")
 
