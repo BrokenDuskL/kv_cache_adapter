@@ -108,11 +108,33 @@ _BaseBuildExtension = BuildExtension.with_options(
 
 
 class KVCacheAdapterBuildExtension(_BaseBuildExtension):
+    def run(self) -> None:
+        super().run()
+        if self.inplace:
+            self._copy_package_sidecars_to_source()
+
     def build_extension(self, ext: Extension) -> None:
         if isinstance(ext, CMakeExtension):
             self._build_cmake_extension(ext)
             return
         super().build_extension(ext)
+
+    def _copy_package_sidecars_to_source(self) -> None:
+        build_package_dir = Path(self.build_lib) / "kv_cache_adapter"
+        sidecars = (
+            "libkv_cache_adapter_npu_custom_kernels.so",
+        )
+        expect_sidecars = any(isinstance(ext, CMakeExtension) for ext in self.extensions)
+        for filename in sidecars:
+            src = build_package_dir / filename
+            if not src.exists():
+                if expect_sidecars:
+                    raise RuntimeError(
+                        f"Expected built sidecar {src} is missing after build_ext --inplace; "
+                        "the package build must place runtime sidecars under build/lib*/kv_cache_adapter/",
+                    )
+                continue
+            shutil.copy2(src, ROOT_DIR / filename)
 
     def _build_cmake_extension(self, ext: CMakeExtension) -> None:
         module_basename = ext.name.rsplit(".", 1)[-1]
@@ -207,10 +229,6 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         dst_path = output_dir / support_lib.name
         if os.path.abspath(support_lib) != os.path.abspath(dst_path):
             shutil.copy2(support_lib, dst_path)
-        if self.inplace:
-            source_dst = ROOT_DIR / support_lib.name
-            if os.path.abspath(support_lib) != os.path.abspath(source_dst):
-                shutil.copy2(support_lib, source_dst)
 
 
 ext_modules: list[Extension] = [
