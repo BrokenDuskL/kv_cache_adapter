@@ -38,6 +38,16 @@ __aicore__ inline void store_tile(
     AscendC::DataCopy(global_tensor, local_tensor, len);
 }
 
+template <typename T>
+inline void *launch_arg(T *ptr) {
+    return reinterpret_cast<void *>(ptr);
+}
+
+template <typename T>
+inline void *launch_arg(const T *ptr) {
+    return const_cast<void *>(reinterpret_cast<const void *>(ptr));
+}
+
 __aicore__ inline int32_t unpack_pin_count(kvca_slotmeta_t meta) {
     return static_cast<int32_t>(meta) & KVCA_PIN_COUNT_MASK;
 }
@@ -531,13 +541,13 @@ void adapter_inspect_load_requests_kernel(
     kvca_slotmeta_t *updated_usage_counts_out,
     int32_t num_logical_ids) {
     adapter_inspect_load_requests_entry<<<block_dim, nullptr, stream>>>(
-        logical_to_physical,
-        slot_meta,
-        logical_block_ids,
-        current_physical_out,
-        resident_mask_out,
-        updated_pin_counts_out,
-        updated_usage_counts_out,
+        launch_arg(logical_to_physical),
+        launch_arg(slot_meta),
+        launch_arg(logical_block_ids),
+        launch_arg(current_physical_out),
+        launch_arg(resident_mask_out),
+        launch_arg(updated_pin_counts_out),
+        launch_arg(updated_usage_counts_out),
         num_logical_ids,
         static_cast<int32_t>(block_dim));
 }
@@ -553,12 +563,12 @@ void adapter_inspect_save_requests_kernel(
     kvca_slotmeta_t *final_usage_counts_out,
     int32_t num_logical_ids) {
     adapter_inspect_save_requests_entry<<<block_dim, nullptr, stream>>>(
-        logical_to_physical,
-        slot_meta,
-        logical_block_ids,
-        current_physical_out,
-        existing_mask_out,
-        final_usage_counts_out,
+        launch_arg(logical_to_physical),
+        launch_arg(slot_meta),
+        launch_arg(logical_block_ids),
+        launch_arg(current_physical_out),
+        launch_arg(existing_mask_out),
+        launch_arg(final_usage_counts_out),
         num_logical_ids,
         static_cast<int32_t>(block_dim));
 }
@@ -580,50 +590,50 @@ void adapter_pop_reusable_slots_kernel(
     int32_t count) {
     if (num_blocked_slot_ids > 0) {
         adapter_mark_blocked_slots_entry<<<block_dim, nullptr, stream>>>(
-            blocked_slot_ids,
-            blocked_mask,
+            launch_arg(blocked_slot_ids),
+            launch_arg(blocked_mask),
             num_blocked_slot_ids,
             static_cast<int32_t>(block_dim));
     }
     for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
         adapter_count_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
-            slot_meta,
-            blocked_mask,
-            search_start,
-            selection_state,
-            local_count_workspace,
+            launch_arg(slot_meta),
+            launch_arg(blocked_mask),
+            launch_arg(search_start),
+            launch_arg(selection_state),
+            launch_arg(local_count_workspace),
             num_actual_blocks,
             threshold,
             static_cast<int32_t>(block_dim));
         adapter_plan_threshold_slots_entry<<<1, nullptr, stream>>>(
-            local_count_workspace,
-            local_offset_workspace,
-            local_emit_workspace,
-            selection_state,
+            launch_arg(local_count_workspace),
+            launch_arg(local_offset_workspace),
+            launch_arg(local_emit_workspace),
+            launch_arg(selection_state),
             static_cast<int32_t>(block_dim),
             count,
             threshold);
         adapter_collect_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
-            slot_meta,
-            blocked_mask,
-            search_start,
-            selection_state,
-            local_offset_workspace,
-            local_emit_workspace,
-            selected_slot_ids_out,
+            launch_arg(slot_meta),
+            launch_arg(blocked_mask),
+            launch_arg(search_start),
+            launch_arg(selection_state),
+            launch_arg(local_offset_workspace),
+            launch_arg(local_emit_workspace),
+            launch_arg(selected_slot_ids_out),
             num_actual_blocks,
             threshold,
             static_cast<int32_t>(block_dim));
     }
     adapter_age_usage_entry<<<block_dim, nullptr, stream>>>(
-        slot_meta,
-        selection_state,
+        launch_arg(slot_meta),
+        launch_arg(selection_state),
         num_actual_blocks,
         static_cast<int32_t>(block_dim));
     adapter_finalize_selected_slots_entry<<<1, nullptr, stream>>>(
-        selection_state,
-        search_start,
-        selected_slot_ids_out,
+        launch_arg(selection_state),
+        launch_arg(search_start),
+        launch_arg(selected_slot_ids_out),
         num_actual_blocks,
         count);
 }
@@ -645,18 +655,18 @@ void adapter_commit_load_metadata_kernel(
     const kvca_slotmeta_t *hit_usage_counts,
     int32_t num_hits) {
     adapter_commit_load_metadata_entry<<<block_dim, nullptr, stream>>>(
-        logical_to_physical,
-        physical_to_logical,
-        slot_meta,
-        evicted_logical_block_ids,
+        launch_arg(logical_to_physical),
+        launch_arg(physical_to_logical),
+        launch_arg(slot_meta),
+        launch_arg(evicted_logical_block_ids),
         num_evicted,
-        miss_logical_block_ids,
-        miss_physical_slot_ids,
-        miss_usage_counts,
+        launch_arg(miss_logical_block_ids),
+        launch_arg(miss_physical_slot_ids),
+        launch_arg(miss_usage_counts),
         num_misses,
-        hit_slot_ids,
-        hit_pin_counts,
-        hit_usage_counts,
+        launch_arg(hit_slot_ids),
+        launch_arg(hit_pin_counts),
+        launch_arg(hit_usage_counts),
         num_hits,
         static_cast<int32_t>(block_dim));
 }
@@ -675,15 +685,15 @@ void adapter_commit_save_metadata_kernel(
     const kvca_slotmeta_t *final_usage_counts,
     int32_t num_slots) {
     adapter_commit_save_metadata_entry<<<block_dim, nullptr, stream>>>(
-        logical_to_physical,
-        physical_to_logical,
-        slot_meta,
-        evicted_logical_block_ids,
+        launch_arg(logical_to_physical),
+        launch_arg(physical_to_logical),
+        launch_arg(slot_meta),
+        launch_arg(evicted_logical_block_ids),
         num_evicted,
-        logical_block_ids,
-        physical_slot_ids,
-        final_pin_counts,
-        final_usage_counts,
+        launch_arg(logical_block_ids),
+        launch_arg(physical_slot_ids),
+        launch_arg(final_pin_counts),
+        launch_arg(final_usage_counts),
         num_slots,
         static_cast<int32_t>(block_dim));
 }
@@ -696,9 +706,9 @@ void adapter_release_metadata_kernel(
     const int64_t *logical_block_ids,
     int32_t num_logical_ids) {
     adapter_release_metadata_entry<<<block_dim, nullptr, stream>>>(
-        logical_to_physical,
-        slot_meta,
-        logical_block_ids,
+        launch_arg(logical_to_physical),
+        launch_arg(slot_meta),
+        launch_arg(logical_block_ids),
         num_logical_ids,
         static_cast<int32_t>(block_dim));
 }
