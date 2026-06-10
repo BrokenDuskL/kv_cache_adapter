@@ -63,15 +63,23 @@ __aicore__ inline kvca_slotmeta_t saturating_increment_usage(kvca_slotmeta_t met
 }
 
 extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
-    __gm__ const int64_t *logical_to_physical,
-    __gm__ const kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *logical_block_ids,
-    __gm__ int64_t *current_physical_out,
-    __gm__ bool *resident_mask_out,
-    __gm__ int64_t *updated_pin_counts_out,
-    __gm__ kvca_slotmeta_t *updated_usage_counts_out,
+    GM_ADDR logical_to_physical_addr,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR logical_block_ids_addr,
+    GM_ADDR current_physical_out_addr,
+    GM_ADDR resident_mask_out_addr,
+    GM_ADDR updated_pin_counts_out_addr,
+    GM_ADDR updated_usage_counts_out_addr,
     int32_t num_logical_ids,
     int32_t block_dim) {
+    __gm__ const int64_t *logical_to_physical = reinterpret_cast<__gm__ const int64_t *>(logical_to_physical_addr);
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
+    __gm__ int64_t *current_physical_out = reinterpret_cast<__gm__ int64_t *>(current_physical_out_addr);
+    __gm__ bool *resident_mask_out = reinterpret_cast<__gm__ bool *>(resident_mask_out_addr);
+    __gm__ int64_t *updated_pin_counts_out = reinterpret_cast<__gm__ int64_t *>(updated_pin_counts_out_addr);
+    __gm__ kvca_slotmeta_t *updated_usage_counts_out =
+        reinterpret_cast<__gm__ kvca_slotmeta_t *>(updated_usage_counts_out_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     const int32_t begin = chunk_begin(num_logical_ids, core_index, block_dim);
     const int32_t end = chunk_end(num_logical_ids, core_index, block_dim);
@@ -93,14 +101,21 @@ extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
-    __gm__ const int64_t *logical_to_physical,
-    __gm__ const kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *logical_block_ids,
-    __gm__ int64_t *current_physical_out,
-    __gm__ bool *existing_mask_out,
-    __gm__ kvca_slotmeta_t *final_usage_counts_out,
+    GM_ADDR logical_to_physical_addr,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR logical_block_ids_addr,
+    GM_ADDR current_physical_out_addr,
+    GM_ADDR existing_mask_out_addr,
+    GM_ADDR final_usage_counts_out_addr,
     int32_t num_logical_ids,
     int32_t block_dim) {
+    __gm__ const int64_t *logical_to_physical = reinterpret_cast<__gm__ const int64_t *>(logical_to_physical_addr);
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
+    __gm__ int64_t *current_physical_out = reinterpret_cast<__gm__ int64_t *>(current_physical_out_addr);
+    __gm__ bool *existing_mask_out = reinterpret_cast<__gm__ bool *>(existing_mask_out_addr);
+    __gm__ kvca_slotmeta_t *final_usage_counts_out =
+        reinterpret_cast<__gm__ kvca_slotmeta_t *>(final_usage_counts_out_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     const int32_t begin = chunk_begin(num_logical_ids, core_index, block_dim);
     const int32_t end = chunk_end(num_logical_ids, core_index, block_dim);
@@ -117,10 +132,12 @@ extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_mark_blocked_slots_entry(
-    __gm__ const int64_t *blocked_slot_ids,
-    __gm__ bool *blocked_mask,
+    GM_ADDR blocked_slot_ids_addr,
+    GM_ADDR blocked_mask_addr,
     int32_t num_blocked_slot_ids,
     int32_t block_dim) {
+    __gm__ const int64_t *blocked_slot_ids = reinterpret_cast<__gm__ const int64_t *>(blocked_slot_ids_addr);
+    __gm__ bool *blocked_mask = reinterpret_cast<__gm__ bool *>(blocked_mask_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     const int32_t begin = chunk_begin(num_blocked_slot_ids, core_index, block_dim);
     const int32_t end = chunk_end(num_blocked_slot_ids, core_index, block_dim);
@@ -144,14 +161,19 @@ extern "C" __global__ __aicore__ void adapter_mark_blocked_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
-    __gm__ const kvca_slotmeta_t *slot_meta,
-    __gm__ const bool *blocked_mask,
-    __gm__ const int64_t *search_start,
-    __gm__ const int64_t *selection_state,
-    __gm__ int64_t *local_count_workspace,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR blocked_mask_addr,
+    GM_ADDR search_start_addr,
+    GM_ADDR selection_state_addr,
+    GM_ADDR local_count_workspace_addr,
     int32_t num_actual_blocks,
     int32_t threshold,
     int32_t block_dim) {
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const bool *blocked_mask = reinterpret_cast<__gm__ const bool *>(blocked_mask_addr);
+    __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
+    __gm__ int64_t *local_count_workspace = reinterpret_cast<__gm__ int64_t *>(local_count_workspace_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     if (selection_state[1] >= 0) {
         local_count_workspace[core_index] = 0;
@@ -202,13 +224,18 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_plan_threshold_slots_entry(
-    __gm__ const int64_t *local_count_workspace,
-    __gm__ int64_t *local_offset_workspace,
-    __gm__ int64_t *local_emit_workspace,
-    __gm__ int64_t *selection_state,
+    GM_ADDR local_count_workspace_addr,
+    GM_ADDR local_offset_workspace_addr,
+    GM_ADDR local_emit_workspace_addr,
+    GM_ADDR selection_state_addr,
     int32_t block_dim,
     int32_t count,
     int32_t threshold) {
+    __gm__ const int64_t *local_count_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_count_workspace_addr);
+    __gm__ int64_t *local_offset_workspace = reinterpret_cast<__gm__ int64_t *>(local_offset_workspace_addr);
+    __gm__ int64_t *local_emit_workspace = reinterpret_cast<__gm__ int64_t *>(local_emit_workspace_addr);
+    __gm__ int64_t *selection_state = reinterpret_cast<__gm__ int64_t *>(selection_state_addr);
     if (AscendC::GetBlockIdx() != 0 || selection_state[1] >= 0) {
         return;
     }
@@ -236,16 +263,25 @@ extern "C" __global__ __aicore__ void adapter_plan_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
-    __gm__ const kvca_slotmeta_t *slot_meta,
-    __gm__ const bool *blocked_mask,
-    __gm__ const int64_t *search_start,
-    __gm__ const int64_t *selection_state,
-    __gm__ const int64_t *local_offset_workspace,
-    __gm__ const int64_t *local_emit_workspace,
-    __gm__ int64_t *selected_slot_ids_out,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR blocked_mask_addr,
+    GM_ADDR search_start_addr,
+    GM_ADDR selection_state_addr,
+    GM_ADDR local_offset_workspace_addr,
+    GM_ADDR local_emit_workspace_addr,
+    GM_ADDR selected_slot_ids_out_addr,
     int32_t num_actual_blocks,
     int32_t threshold,
     int32_t block_dim) {
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const bool *blocked_mask = reinterpret_cast<__gm__ const bool *>(blocked_mask_addr);
+    __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
+    __gm__ const int64_t *local_offset_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_offset_workspace_addr);
+    __gm__ const int64_t *local_emit_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_emit_workspace_addr);
+    __gm__ int64_t *selected_slot_ids_out = reinterpret_cast<__gm__ int64_t *>(selected_slot_ids_out_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     if (selection_state[1] >= 0 && selection_state[1] != threshold) {
         return;
@@ -300,10 +336,12 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_age_usage_entry(
-    __gm__ kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *selection_state,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR selection_state_addr,
     int32_t num_actual_blocks,
     int32_t block_dim) {
+    __gm__ kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
     const int32_t threshold = static_cast<int32_t>(selection_state[1]);
     if (threshold <= 0) {
         return;
@@ -337,11 +375,14 @@ extern "C" __global__ __aicore__ void adapter_age_usage_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_finalize_selected_slots_entry(
-    __gm__ const int64_t *selection_state,
-    __gm__ int64_t *search_start,
-    __gm__ int64_t *selected_slot_ids_out,
+    GM_ADDR selection_state_addr,
+    GM_ADDR search_start_addr,
+    GM_ADDR selected_slot_ids_out_addr,
     int32_t num_actual_blocks,
     int32_t count) {
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
+    __gm__ int64_t *search_start = reinterpret_cast<__gm__ int64_t *>(search_start_addr);
+    __gm__ int64_t *selected_slot_ids_out = reinterpret_cast<__gm__ int64_t *>(selected_slot_ids_out_addr);
     if (AscendC::GetBlockIdx() != 0) {
         return;
     }
@@ -356,20 +397,35 @@ extern "C" __global__ __aicore__ void adapter_finalize_selected_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_commit_load_metadata_entry(
-    __gm__ int64_t *logical_to_physical,
-    __gm__ int64_t *physical_to_logical,
-    __gm__ kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *evicted_logical_block_ids,
+    GM_ADDR logical_to_physical_addr,
+    GM_ADDR physical_to_logical_addr,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR evicted_logical_block_ids_addr,
     int32_t num_evicted,
-    __gm__ const int64_t *miss_logical_block_ids,
-    __gm__ const int64_t *miss_physical_slot_ids,
-    __gm__ const kvca_slotmeta_t *miss_usage_counts,
+    GM_ADDR miss_logical_block_ids_addr,
+    GM_ADDR miss_physical_slot_ids_addr,
+    GM_ADDR miss_usage_counts_addr,
     int32_t num_misses,
-    __gm__ const int64_t *hit_slot_ids,
-    __gm__ const int64_t *hit_pin_counts,
-    __gm__ const kvca_slotmeta_t *hit_usage_counts,
+    GM_ADDR hit_slot_ids_addr,
+    GM_ADDR hit_pin_counts_addr,
+    GM_ADDR hit_usage_counts_addr,
     int32_t num_hits,
     int32_t block_dim) {
+    __gm__ int64_t *logical_to_physical = reinterpret_cast<__gm__ int64_t *>(logical_to_physical_addr);
+    __gm__ int64_t *physical_to_logical = reinterpret_cast<__gm__ int64_t *>(physical_to_logical_addr);
+    __gm__ kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *evicted_logical_block_ids =
+        reinterpret_cast<__gm__ const int64_t *>(evicted_logical_block_ids_addr);
+    __gm__ const int64_t *miss_logical_block_ids =
+        reinterpret_cast<__gm__ const int64_t *>(miss_logical_block_ids_addr);
+    __gm__ const int64_t *miss_physical_slot_ids =
+        reinterpret_cast<__gm__ const int64_t *>(miss_physical_slot_ids_addr);
+    __gm__ const kvca_slotmeta_t *miss_usage_counts =
+        reinterpret_cast<__gm__ const kvca_slotmeta_t *>(miss_usage_counts_addr);
+    __gm__ const int64_t *hit_slot_ids = reinterpret_cast<__gm__ const int64_t *>(hit_slot_ids_addr);
+    __gm__ const int64_t *hit_pin_counts = reinterpret_cast<__gm__ const int64_t *>(hit_pin_counts_addr);
+    __gm__ const kvca_slotmeta_t *hit_usage_counts =
+        reinterpret_cast<__gm__ const kvca_slotmeta_t *>(hit_usage_counts_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
 
     int32_t begin = chunk_begin(num_evicted, core_index, block_dim);
@@ -398,17 +454,27 @@ extern "C" __global__ __aicore__ void adapter_commit_load_metadata_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_commit_save_metadata_entry(
-    __gm__ int64_t *logical_to_physical,
-    __gm__ int64_t *physical_to_logical,
-    __gm__ kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *evicted_logical_block_ids,
+    GM_ADDR logical_to_physical_addr,
+    GM_ADDR physical_to_logical_addr,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR evicted_logical_block_ids_addr,
     int32_t num_evicted,
-    __gm__ const int64_t *logical_block_ids,
-    __gm__ const int64_t *physical_slot_ids,
-    __gm__ const int64_t *final_pin_counts,
-    __gm__ const kvca_slotmeta_t *final_usage_counts,
+    GM_ADDR logical_block_ids_addr,
+    GM_ADDR physical_slot_ids_addr,
+    GM_ADDR final_pin_counts_addr,
+    GM_ADDR final_usage_counts_addr,
     int32_t num_slots,
     int32_t block_dim) {
+    __gm__ int64_t *logical_to_physical = reinterpret_cast<__gm__ int64_t *>(logical_to_physical_addr);
+    __gm__ int64_t *physical_to_logical = reinterpret_cast<__gm__ int64_t *>(physical_to_logical_addr);
+    __gm__ kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *evicted_logical_block_ids =
+        reinterpret_cast<__gm__ const int64_t *>(evicted_logical_block_ids_addr);
+    __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
+    __gm__ const int64_t *physical_slot_ids = reinterpret_cast<__gm__ const int64_t *>(physical_slot_ids_addr);
+    __gm__ const int64_t *final_pin_counts = reinterpret_cast<__gm__ const int64_t *>(final_pin_counts_addr);
+    __gm__ const kvca_slotmeta_t *final_usage_counts =
+        reinterpret_cast<__gm__ const kvca_slotmeta_t *>(final_usage_counts_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
 
     int32_t begin = chunk_begin(num_evicted, core_index, block_dim);
@@ -431,11 +497,14 @@ extern "C" __global__ __aicore__ void adapter_commit_save_metadata_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_release_metadata_entry(
-    __gm__ const int64_t *logical_to_physical,
-    __gm__ kvca_slotmeta_t *slot_meta,
-    __gm__ const int64_t *logical_block_ids,
+    GM_ADDR logical_to_physical_addr,
+    GM_ADDR slot_meta_addr,
+    GM_ADDR logical_block_ids_addr,
     int32_t num_logical_ids,
     int32_t block_dim) {
+    __gm__ const int64_t *logical_to_physical = reinterpret_cast<__gm__ const int64_t *>(logical_to_physical_addr);
+    __gm__ kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     const int32_t begin = chunk_begin(num_logical_ids, core_index, block_dim);
     const int32_t end = chunk_end(num_logical_ids, core_index, block_dim);
@@ -516,7 +585,7 @@ void adapter_pop_reusable_slots_kernel(
             num_blocked_slot_ids,
             static_cast<int32_t>(block_dim));
     }
-    for (int32_t threshold = 0; threshold <= kUsageCountMax; ++threshold) {
+    for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
         adapter_count_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
             slot_meta,
             blocked_mask,
