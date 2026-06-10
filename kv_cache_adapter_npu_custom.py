@@ -23,28 +23,21 @@ def _load_ops_module():
     support_lib = module_dir / "libkv_cache_adapter_npu_custom_kernels.so"
     if support_lib.exists():
         ctypes.CDLL(str(support_lib), mode=ctypes.RTLD_GLOBAL)
-    if __package__:
-        qualified_name = f"{__package__}.kv_cache_adapter_npu_custom_ops"
-        try:
-            module = importlib.import_module(qualified_name)
-        except Exception:
-            direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
-            if direct_spec is None or direct_spec.loader is None:  # pragma: no cover - depends on Ascend runtime
-                raise
-            module = importlib.util.module_from_spec(direct_spec)
-            sys.modules[qualified_name] = module
-            sys.modules.setdefault("kv_cache_adapter_npu_custom_ops", module)
-            direct_spec.loader.exec_module(module)
-    else:
-        direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
-        if direct_spec is None or direct_spec.loader is None:  # pragma: no cover - depends on Ascend runtime
-            raise ImportError(
-                f"kv_cache_adapter_npu_custom_ops not found next to {__file__}; rebuild with "
-                "python setup.py build_ext --inplace or install the package",
-            )
+    direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
+    if direct_spec is not None and direct_spec.loader is not None:
         module = importlib.util.module_from_spec(direct_spec)
         sys.modules["kv_cache_adapter_npu_custom_ops"] = module
+        if __package__:
+            sys.modules.setdefault(f"{__package__}.kv_cache_adapter_npu_custom_ops", module)
         direct_spec.loader.exec_module(module)
+    elif __package__:
+        qualified_name = f"{__package__}.kv_cache_adapter_npu_custom_ops"
+        module = importlib.import_module(qualified_name)
+    else:
+        raise ImportError(
+            f"kv_cache_adapter_npu_custom_ops not found next to {__file__}; rebuild with "
+            "python setup.py build_ext --inplace or install the package",
+        )
     missing_exports = [name for name in _EXPORTS if not hasattr(module, name)]
     if missing_exports:  # pragma: no cover - depends on Ascend runtime
         raise ImportError(

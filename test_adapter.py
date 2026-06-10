@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import importlib.machinery
 import pathlib
+import sys
 import types
 
 import pytest
@@ -501,21 +502,44 @@ def test_lmcache_backend_init_does_not_import_gpu_ops(monkeypatch: pytest.Monkey
 
 
 def test_load_npu_extension_prefers_custom_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
-    custom_module = object()
     legacy_module = object()
+    wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
 
     def fake_import(name: str, package: str | None = None) -> object:
         del package
         if name in {"kv_cache_adapter_npu_custom", "kv_cache_adapter.kv_cache_adapter_npu_custom"}:
-            return custom_module
+            raise AssertionError("adapter should load local wrapper from its own directory before global import")
         if name in {"kv_cache_adapter_npu", "kv_cache_adapter.kv_cache_adapter_npu"}:
             return legacy_module
         raise ImportError(name)
 
+    class _WrapperLoader:
+        def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+            del spec
+            return None
+
+        def exec_module(self, module: types.ModuleType) -> None:
+            module._marker = "local-wrapper"
+
+    real_find_spec = adapter_module.importlib.machinery.PathFinder.find_spec
+
+    def fake_find_spec(
+        fullname: str,
+        path: list[str] | None = None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        del target
+        if fullname == "kv_cache_adapter_npu_custom":
+            assert path == [str(wrapper_path.parent)]
+            return importlib.machinery.ModuleSpec(fullname, _WrapperLoader(), origin=str(wrapper_path))
+        return real_find_spec(fullname, path)
+
     adapter_module._load_npu_extension_module.cache_clear()
     monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
+    monkeypatch.setattr(adapter_module.importlib.machinery.PathFinder, "find_spec", fake_find_spec)
 
-    assert adapter_module._load_npu_extension_module() is custom_module
+    module = adapter_module._load_npu_extension_module()
+    assert getattr(module, "_marker", None) == "local-wrapper"
 
 
 def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -567,3 +591,57 @@ def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPat
     assert module.inspect_load_requests(1, 2) == ("inspect_load_requests", (1, 2))
     assert "lmcache_ascend.c_ops" not in imported_modules
     assert "kv_cache_adapter_npu_custom_ops" not in imported_modules
+
+
+def test_packaged_npu_custom_wrapper_prefers_sibling_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
+    imported_modules: list[str] = []
+
+    class _StandaloneLoader:
+        def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+            del spec
+            return None
+
+        def exec_module(self, module: types.ModuleType) -> None:
+            module.inspect_load_requests = lambda *args: ("inspect_load_requests", args)
+            module.inspect_save_requests = lambda *args: ("inspect_save_requests", args)
+            module.pop_reusable_slots = lambda *args: ("pop_reusable_slots", args)
+            module.commit_load_metadata = lambda *args: ("commit_load_metadata", args)
+            module.commit_save_metadata = lambda *args: ("commit_save_metadata", args)
+            module.release_metadata = lambda *args: ("release_metadata", args)
+
+    real_import = adapter_module.importlib.import_module
+    real_find_spec = adapter_module.importlib.machinery.PathFinder.find_spec
+
+    def fake_import(name: str, package: str | None = None) -> object:
+        del package
+        imported_modules.append(name)
+        if name == "kv_cache_adapter.kv_cache_adapter_npu_custom_ops":
+            raise AssertionError("packaged wrapper should prefer sibling ops before qualified import")
+        return real_import(name)
+
+    def fake_find_spec(
+        fullname: str,
+        path: list[str] | None = None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        del target
+        if fullname == "kv_cache_adapter_npu_custom_ops":
+            assert path == [str(wrapper_path.parent)]
+            return importlib.machinery.ModuleSpec(fullname, _StandaloneLoader(), origin=str(wrapper_path.parent))
+        return real_find_spec(fullname, path)
+
+    monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
+    monkeypatch.setattr(adapter_module.importlib.machinery.PathFinder, "find_spec", fake_find_spec)
+    package_module = types.ModuleType("kv_cache_adapter")
+    package_module.__path__ = [str(wrapper_path.parent)]  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kv_cache_adapter", package_module)
+    spec = importlib.util.spec_from_file_location("kv_cache_adapter.kv_cache_adapter_npu_custom", wrapper_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["kv_cache_adapter.kv_cache_adapter_npu_custom"] = module
+    spec.loader.exec_module(module)
+
+    assert module.inspect_load_requests(1, 2) == ("inspect_load_requests", (1, 2))
+    assert "kv_cache_adapter.kv_cache_adapter_npu_custom_ops" not in imported_modules

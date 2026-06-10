@@ -1326,14 +1326,15 @@ class _NoopMemoryAllocator:
 
 @lru_cache(maxsize=1)
 def _load_cuda_extension_module() -> Any | None:
-    if not __package__:
-        module_dir = pathlib.Path(__file__).resolve().parent
-        direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_cuda", [str(module_dir)])
-        if direct_spec is not None and direct_spec.loader is not None:
-            module = importlib.util.module_from_spec(direct_spec)
-            sys.modules["kv_cache_adapter_cuda"] = module
-            direct_spec.loader.exec_module(module)
-            return module
+    module_dir = pathlib.Path(__file__).resolve().parent
+    direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_cuda", [str(module_dir)])
+    if direct_spec is not None and direct_spec.loader is not None:
+        module = importlib.util.module_from_spec(direct_spec)
+        sys.modules["kv_cache_adapter_cuda"] = module
+        if __package__:
+            sys.modules.setdefault(f"{__package__}.kv_cache_adapter_cuda", module)
+        direct_spec.loader.exec_module(module)
+        return module
     module_names = []
     if __package__:
         module_names.append(f"{__package__}.kv_cache_adapter_cuda")
@@ -1348,20 +1349,23 @@ def _load_cuda_extension_module() -> Any | None:
 
 @lru_cache(maxsize=1)
 def _load_npu_extension_module() -> Any | None:
-    if not __package__:
-        module_dir = pathlib.Path(__file__).resolve().parent
-        wrapper_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom", [str(module_dir)])
-        if wrapper_spec is not None and wrapper_spec.loader is not None:
-            module = importlib.util.module_from_spec(wrapper_spec)
-            sys.modules["kv_cache_adapter_npu_custom"] = module
-            wrapper_spec.loader.exec_module(module)
-            return module
-        legacy_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu", [str(module_dir)])
-        if legacy_spec is not None and legacy_spec.loader is not None:
-            module = importlib.util.module_from_spec(legacy_spec)
-            sys.modules["kv_cache_adapter_npu"] = module
-            legacy_spec.loader.exec_module(module)
-            return module
+    module_dir = pathlib.Path(__file__).resolve().parent
+    wrapper_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom", [str(module_dir)])
+    if wrapper_spec is not None and wrapper_spec.loader is not None:
+        module = importlib.util.module_from_spec(wrapper_spec)
+        sys.modules["kv_cache_adapter_npu_custom"] = module
+        if __package__:
+            sys.modules.setdefault(f"{__package__}.kv_cache_adapter_npu_custom", module)
+        wrapper_spec.loader.exec_module(module)
+        return module
+    legacy_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu", [str(module_dir)])
+    if legacy_spec is not None and legacy_spec.loader is not None:
+        module = importlib.util.module_from_spec(legacy_spec)
+        sys.modules["kv_cache_adapter_npu"] = module
+        if __package__:
+            sys.modules.setdefault(f"{__package__}.kv_cache_adapter_npu", module)
+        legacy_spec.loader.exec_module(module)
+        return module
     if __package__:
         qualified_custom = f"{__package__}.kv_cache_adapter_npu_custom"
         try:
