@@ -32,7 +32,7 @@ void adapter_inspect_load_requests_kernel(
     const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
-    bool *resident_mask_out,
+    uint8_t *resident_mask_out,
     int64_t *updated_pin_counts_out,
     kvca_slotmeta_t *updated_usage_counts_out,
     int32_t num_logical_ids);
@@ -44,7 +44,7 @@ void adapter_inspect_save_requests_kernel(
     const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
-    bool *existing_mask_out,
+    uint8_t *existing_mask_out,
     kvca_slotmeta_t *final_usage_counts_out,
     int32_t num_logical_ids);
 

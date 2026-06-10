@@ -86,7 +86,7 @@ extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
     __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
     __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
     __gm__ int64_t *current_physical_out = reinterpret_cast<__gm__ int64_t *>(current_physical_out_addr);
-    __gm__ bool *resident_mask_out = reinterpret_cast<__gm__ bool *>(resident_mask_out_addr);
+    __gm__ uint8_t *resident_mask_out = reinterpret_cast<__gm__ uint8_t *>(resident_mask_out_addr);
     __gm__ int64_t *updated_pin_counts_out = reinterpret_cast<__gm__ int64_t *>(updated_pin_counts_out_addr);
     __gm__ kvca_slotmeta_t *updated_usage_counts_out =
         reinterpret_cast<__gm__ kvca_slotmeta_t *>(updated_usage_counts_out_addr);
@@ -98,7 +98,7 @@ extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
         const int64_t physical_slot_id = logical_to_physical[logical_block_id];
         current_physical_out[index] = physical_slot_id;
         const bool resident = physical_slot_id >= 0;
-        resident_mask_out[index] = resident;
+        resident_mask_out[index] = resident ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
         if (resident) {
             const kvca_slotmeta_t meta = slot_meta[physical_slot_id];
             updated_pin_counts_out[index] = unpack_pin_count(meta) + 1;
@@ -123,7 +123,7 @@ extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
     __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
     __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
     __gm__ int64_t *current_physical_out = reinterpret_cast<__gm__ int64_t *>(current_physical_out_addr);
-    __gm__ bool *existing_mask_out = reinterpret_cast<__gm__ bool *>(existing_mask_out_addr);
+    __gm__ uint8_t *existing_mask_out = reinterpret_cast<__gm__ uint8_t *>(existing_mask_out_addr);
     __gm__ kvca_slotmeta_t *final_usage_counts_out =
         reinterpret_cast<__gm__ kvca_slotmeta_t *>(final_usage_counts_out_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -134,7 +134,7 @@ extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
         const int64_t physical_slot_id = logical_to_physical[logical_block_id];
         current_physical_out[index] = physical_slot_id;
         const bool existing = physical_slot_id >= 0;
-        existing_mask_out[index] = existing;
+        existing_mask_out[index] = existing ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0);
         final_usage_counts_out[index] = existing
             ? static_cast<kvca_slotmeta_t>(unpack_usage_count(saturating_increment_usage(slot_meta[physical_slot_id])))
             : static_cast<kvca_slotmeta_t>(1);
@@ -536,7 +536,7 @@ void adapter_inspect_load_requests_kernel(
     const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
-    bool *resident_mask_out,
+    uint8_t *resident_mask_out,
     int64_t *updated_pin_counts_out,
     kvca_slotmeta_t *updated_usage_counts_out,
     int32_t num_logical_ids) {
@@ -559,7 +559,7 @@ void adapter_inspect_save_requests_kernel(
     const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
-    bool *existing_mask_out,
+    uint8_t *existing_mask_out,
     kvca_slotmeta_t *final_usage_counts_out,
     int32_t num_logical_ids) {
     adapter_inspect_save_requests_entry<<<block_dim, nullptr, stream>>>(

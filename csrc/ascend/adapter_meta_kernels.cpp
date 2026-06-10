@@ -63,7 +63,7 @@ std::vector<torch::Tensor> inspect_load_requests(
   check_same_device(logical_to_physical, logical_block_ids, "logical_to_physical", "logical_block_ids");
 
   auto current_physical = torch::empty_like(logical_block_ids);
-  auto resident_mask = torch::zeros(logical_block_ids.sizes(), logical_block_ids.options().dtype(torch::kBool));
+  auto resident_mask = torch::zeros(logical_block_ids.sizes(), logical_block_ids.options().dtype(torch::kUInt8));
   auto updated_pin_counts = torch::zeros_like(logical_block_ids);
   auto updated_usage_counts = torch::zeros(logical_block_ids.sizes(), slot_meta.options());
 
@@ -80,7 +80,7 @@ std::vector<torch::Tensor> inspect_load_requests(
         slot_meta.data_ptr<kvca_slotmeta_t>(),
         logical_block_ids.data_ptr<int64_t>(),
         current_physical.data_ptr<int64_t>(),
-        resident_mask.data_ptr<bool>(),
+        resident_mask.data_ptr<uint8_t>(),
         updated_pin_counts.data_ptr<int64_t>(),
         updated_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
@@ -101,7 +101,7 @@ std::vector<torch::Tensor> inspect_save_requests(
   check_same_device(logical_to_physical, logical_block_ids, "logical_to_physical", "logical_block_ids");
 
   auto current_physical = torch::empty_like(logical_block_ids);
-  auto existing_mask = torch::zeros(logical_block_ids.sizes(), logical_block_ids.options().dtype(torch::kBool));
+  auto existing_mask = torch::zeros(logical_block_ids.sizes(), logical_block_ids.options().dtype(torch::kUInt8));
   auto final_usage_counts = torch::ones(logical_block_ids.sizes(), slot_meta.options());
 
   const c10::OptionalDeviceGuard device_guard(logical_block_ids.device());
@@ -117,7 +117,7 @@ std::vector<torch::Tensor> inspect_save_requests(
         slot_meta.data_ptr<kvca_slotmeta_t>(),
         logical_block_ids.data_ptr<int64_t>(),
         current_physical.data_ptr<int64_t>(),
-        existing_mask.data_ptr<bool>(),
+        existing_mask.data_ptr<uint8_t>(),
         final_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;

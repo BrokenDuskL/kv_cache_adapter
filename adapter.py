@@ -219,19 +219,23 @@ class KVCacheAdapter:
             return
 
         current_physical, existing_mask, _ = self._inspect_save_requests(logical_block_ids)
-        existing_physical = current_physical[existing_mask]
-        missing_ids = logical_block_ids[~existing_mask]
+        existing_positions = _selected_positions(existing_mask)
+        missing_positions = _unselected_positions(existing_mask)
+        existing_physical = current_physical.index_select(0, existing_positions)
+        missing_ids = logical_block_ids.index_select(0, missing_positions)
         allocated_physical = self._pop_reusable_slots(missing_ids.shape[0], blocked_slot_ids=existing_physical)
 
         selected_physical = current_physical.clone()
         if missing_ids.numel() > 0:
-            selected_physical[~existing_mask] = allocated_physical
+            selected_physical.index_copy_(0, missing_positions, allocated_physical)
 
         final_pin_counts = self._pin_count.index_select(0, selected_physical)
         final_usage_counts = torch.ones_like(logical_block_ids, dtype=USAGE_DTYPE)
         if existing_physical.numel() > 0:
-            final_usage_counts[existing_mask] = _saturating_increment_usage(
-                self._usage_count.index_select(0, existing_physical),
+            final_usage_counts.index_copy_(
+                0,
+                existing_positions,
+                _saturating_increment_usage(self._usage_count.index_select(0, existing_physical)),
             )
         eviction_plan = self._build_eviction_plan(logical_block_ids, selected_physical)
 
@@ -257,8 +261,10 @@ class KVCacheAdapter:
         current_physical, resident_mask, updated_pin_counts, _ = self._inspect_load_requests(
             logical_block_ids,
         )
-        hit_slot_ids = current_physical[resident_mask]
-        miss_logical_ids = logical_block_ids[~resident_mask]
+        resident_positions = _selected_positions(resident_mask)
+        miss_positions = _unselected_positions(resident_mask)
+        hit_slot_ids = current_physical.index_select(0, resident_positions)
+        miss_logical_ids = logical_block_ids.index_select(0, miss_positions)
         miss_physical_slot_ids = self._pop_reusable_slots(miss_logical_ids.shape[0], blocked_slot_ids=hit_slot_ids)
         eviction_plan = self._build_eviction_plan(miss_logical_ids, miss_physical_slot_ids)
 
@@ -284,7 +290,7 @@ class KVCacheAdapter:
             miss_logical_block_ids=miss_logical_ids,
             miss_physical_slot_ids=miss_physical_slot_ids,
             hit_slot_ids=hit_slot_ids,
-            hit_pin_counts=updated_pin_counts[resident_mask],
+            hit_pin_counts=updated_pin_counts.index_select(0, resident_positions),
             hit_usage_counts=hit_usage_counts,
             miss_usage_counts=miss_usage_counts,
         )
@@ -405,11 +411,12 @@ class KVCacheAdapter:
         if resident_mask.numel() == 0 or not torch.any(resident_mask):
             return current_physical, resident_mask, updated_pin_counts, updated_usage_counts
 
-        hit_slot_ids = current_physical[resident_mask]
+        resident_positions = _selected_positions(resident_mask)
+        hit_slot_ids = current_physical.index_select(0, resident_positions)
         hit_pin_counts = self._pin_count.index_select(0, hit_slot_ids) + 1
         hit_usage_counts = _saturating_increment_usage(self._usage_count.index_select(0, hit_slot_ids))
-        updated_pin_counts[resident_mask] = hit_pin_counts.to(dtype=updated_pin_counts.dtype)
-        updated_usage_counts[resident_mask] = hit_usage_counts
+        updated_pin_counts.index_copy_(0, resident_positions, hit_pin_counts.to(dtype=updated_pin_counts.dtype))
+        updated_usage_counts.index_copy_(0, resident_positions, hit_usage_counts)
         return current_physical, resident_mask, updated_pin_counts, updated_usage_counts
 
     def _inspect_save_requests(
@@ -441,9 +448,12 @@ class KVCacheAdapter:
         if existing_mask.numel() == 0 or not torch.any(existing_mask):
             return current_physical, existing_mask, final_usage_counts
 
-        existing_physical = current_physical[existing_mask]
-        final_usage_counts[existing_mask] = _saturating_increment_usage(
-            self._usage_count.index_select(0, existing_physical),
+        existing_positions = _selected_positions(existing_mask)
+        existing_physical = current_physical.index_select(0, existing_positions)
+        final_usage_counts.index_copy_(
+            0,
+            existing_positions,
+            _saturating_increment_usage(self._usage_count.index_select(0, existing_physical)),
         )
         return current_physical, existing_mask, final_usage_counts
 
@@ -1410,6 +1420,14 @@ def _pack_slot_meta(pin_counts: torch.Tensor, usage_counts: torch.Tensor) -> tor
         | ((usage_counts.to(dtype=torch.int32) & _USAGE_COUNT_MASK) << _USAGE_COUNT_SHIFT)
     )
     return packed.to(dtype=SLOT_META_DTYPE)
+
+
+def _selected_positions(mask: torch.Tensor) -> torch.Tensor:
+    return torch.nonzero(mask.to(dtype=torch.int32), as_tuple=False).flatten()
+
+
+def _unselected_positions(mask: torch.Tensor) -> torch.Tensor:
+    return torch.nonzero(mask.to(dtype=torch.int32) == 0, as_tuple=False).flatten()
 
 
 def _require_id_tensor(values: torch.Tensor, *, name: str) -> None:
