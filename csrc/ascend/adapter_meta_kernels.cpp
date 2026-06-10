@@ -77,12 +77,12 @@ std::vector<torch::Tensor> inspect_load_requests(
         block_dim,
         stream,
         logical_to_physical.data_ptr<int64_t>(),
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         logical_block_ids.data_ptr<int64_t>(),
         current_physical.data_ptr<int64_t>(),
         resident_mask.data_ptr<bool>(),
         updated_pin_counts.data_ptr<int64_t>(),
-        updated_usage_counts.data_ptr<kvcache_ops::slotmeta_t>(),
+        updated_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;
   });
@@ -114,11 +114,11 @@ std::vector<torch::Tensor> inspect_save_requests(
         block_dim,
         stream,
         logical_to_physical.data_ptr<int64_t>(),
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         logical_block_ids.data_ptr<int64_t>(),
         current_physical.data_ptr<int64_t>(),
         existing_mask.data_ptr<bool>(),
-        final_usage_counts.data_ptr<kvcache_ops::slotmeta_t>(),
+        final_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;
   });
@@ -158,7 +158,7 @@ torch::Tensor pop_reusable_slots(
     kvcache_ops::adapter_pop_reusable_slots_kernel(
         block_dim,
         stream,
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         search_start.data_ptr<int64_t>(),
         blocked_slot_ids.data_ptr<int64_t>(),
         blocked_mask.data_ptr<bool>(),
@@ -210,16 +210,16 @@ void commit_load_metadata(
         stream,
         logical_to_physical.data_ptr<int64_t>(),
         physical_to_logical.data_ptr<int64_t>(),
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         evicted_logical_block_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(evicted_logical_block_ids.numel()),
         miss_logical_block_ids.data_ptr<int64_t>(),
         miss_physical_slot_ids.data_ptr<int64_t>(),
-        miss_usage_counts.data_ptr<kvcache_ops::slotmeta_t>(),
+        miss_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(miss_logical_block_ids.numel()),
         hit_slot_ids.data_ptr<int64_t>(),
         hit_pin_counts.data_ptr<int64_t>(),
-        hit_usage_counts.data_ptr<kvcache_ops::slotmeta_t>(),
+        hit_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(hit_slot_ids.numel()));
     return 0;
   });
@@ -255,13 +255,13 @@ void commit_save_metadata(
         stream,
         logical_to_physical.data_ptr<int64_t>(),
         physical_to_logical.data_ptr<int64_t>(),
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         evicted_logical_block_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(evicted_logical_block_ids.numel()),
         logical_block_ids.data_ptr<int64_t>(),
         physical_slot_ids.data_ptr<int64_t>(),
         final_pin_counts.data_ptr<int64_t>(),
-        final_usage_counts.data_ptr<kvcache_ops::slotmeta_t>(),
+        final_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;
   });
@@ -288,7 +288,7 @@ void release_metadata(
         block_dim,
         stream,
         logical_to_physical.data_ptr<int64_t>(),
-        slot_meta.data_ptr<kvcache_ops::slotmeta_t>(),
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
         logical_block_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;

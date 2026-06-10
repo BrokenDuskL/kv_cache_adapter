@@ -38,38 +38,38 @@ __aicore__ inline void store_tile(
     AscendC::DataCopy(global_tensor, local_tensor, len);
 }
 
-__aicore__ inline int32_t unpack_pin_count(kvcache_ops::slotmeta_t meta) {
-    return static_cast<int32_t>(meta) & kvcache_ops::kPinCountMask;
+__aicore__ inline int32_t unpack_pin_count(kvca_slotmeta_t meta) {
+    return static_cast<int32_t>(meta) & KVCA_PIN_COUNT_MASK;
 }
 
-__aicore__ inline int32_t unpack_usage_count(kvcache_ops::slotmeta_t meta) {
-    return (static_cast<int32_t>(meta) >> kvcache_ops::kUsageCountShift) & kvcache_ops::kUsageCountMask;
+__aicore__ inline int32_t unpack_usage_count(kvca_slotmeta_t meta) {
+    return (static_cast<int32_t>(meta) >> KVCA_USAGE_COUNT_SHIFT) & KVCA_USAGE_COUNT_MASK;
 }
 
-__aicore__ inline kvcache_ops::slotmeta_t pack_slot_meta(int32_t pin_count, int32_t usage_count) {
+__aicore__ inline kvca_slotmeta_t pack_slot_meta(int32_t pin_count, int32_t usage_count) {
     const int32_t clamped_pin =
-        pin_count > kvcache_ops::kPinCountMask ? kvcache_ops::kPinCountMask : (pin_count < 0 ? 0 : pin_count);
+        pin_count > KVCA_PIN_COUNT_MASK ? KVCA_PIN_COUNT_MASK : (pin_count < 0 ? 0 : pin_count);
     const int32_t clamped_usage =
-        usage_count > kvcache_ops::kUsageCountMask ? kvcache_ops::kUsageCountMask : (usage_count < 0 ? 0 : usage_count);
-    return static_cast<kvcache_ops::slotmeta_t>(clamped_pin | (clamped_usage << kvcache_ops::kUsageCountShift));
+        usage_count > KVCA_USAGE_COUNT_MASK ? KVCA_USAGE_COUNT_MASK : (usage_count < 0 ? 0 : usage_count);
+    return static_cast<kvca_slotmeta_t>(clamped_pin | (clamped_usage << KVCA_USAGE_COUNT_SHIFT));
 }
 
-__aicore__ inline kvcache_ops::slotmeta_t saturating_increment_usage(kvcache_ops::slotmeta_t meta) {
+__aicore__ inline kvca_slotmeta_t saturating_increment_usage(kvca_slotmeta_t meta) {
     const int32_t pin_count = unpack_pin_count(meta);
     const int32_t usage_count = unpack_usage_count(meta);
     const int32_t incremented =
-        usage_count == kvcache_ops::kUsageCountMax ? usage_count : static_cast<int32_t>(usage_count + 1);
+        usage_count == KVCA_USAGE_COUNT_MAX ? usage_count : static_cast<int32_t>(usage_count + 1);
     return pack_slot_meta(pin_count, incremented);
 }
 
 extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
-    const __gm__ int64_t *logical_to_physical,
-    const __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *logical_block_ids,
+    __gm__ const int64_t *logical_to_physical,
+    __gm__ const kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *logical_block_ids,
     __gm__ int64_t *current_physical_out,
     __gm__ bool *resident_mask_out,
     __gm__ int64_t *updated_pin_counts_out,
-    __gm__ kvcache_ops::slotmeta_t *updated_usage_counts_out,
+    __gm__ kvca_slotmeta_t *updated_usage_counts_out,
     int32_t num_logical_ids,
     int32_t block_dim) {
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -82,9 +82,9 @@ extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
         const bool resident = physical_slot_id >= 0;
         resident_mask_out[index] = resident;
         if (resident) {
-            const kvcache_ops::slotmeta_t meta = slot_meta[physical_slot_id];
+            const kvca_slotmeta_t meta = slot_meta[physical_slot_id];
             updated_pin_counts_out[index] = unpack_pin_count(meta) + 1;
-            updated_usage_counts_out[index] = static_cast<kvcache_ops::slotmeta_t>(unpack_usage_count(saturating_increment_usage(meta)));
+            updated_usage_counts_out[index] = static_cast<kvca_slotmeta_t>(unpack_usage_count(saturating_increment_usage(meta)));
         } else {
             updated_pin_counts_out[index] = 0;
             updated_usage_counts_out[index] = 0;
@@ -93,12 +93,12 @@ extern "C" __global__ __aicore__ void adapter_inspect_load_requests_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
-    const __gm__ int64_t *logical_to_physical,
-    const __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *logical_block_ids,
+    __gm__ const int64_t *logical_to_physical,
+    __gm__ const kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *logical_block_ids,
     __gm__ int64_t *current_physical_out,
     __gm__ bool *existing_mask_out,
-    __gm__ kvcache_ops::slotmeta_t *final_usage_counts_out,
+    __gm__ kvca_slotmeta_t *final_usage_counts_out,
     int32_t num_logical_ids,
     int32_t block_dim) {
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -111,13 +111,13 @@ extern "C" __global__ __aicore__ void adapter_inspect_save_requests_entry(
         const bool existing = physical_slot_id >= 0;
         existing_mask_out[index] = existing;
         final_usage_counts_out[index] = existing
-            ? static_cast<kvcache_ops::slotmeta_t>(unpack_usage_count(saturating_increment_usage(slot_meta[physical_slot_id])))
-            : static_cast<kvcache_ops::slotmeta_t>(1);
+            ? static_cast<kvca_slotmeta_t>(unpack_usage_count(saturating_increment_usage(slot_meta[physical_slot_id])))
+            : static_cast<kvca_slotmeta_t>(1);
     }
 }
 
 extern "C" __global__ __aicore__ void adapter_mark_blocked_slots_entry(
-    const __gm__ int64_t *blocked_slot_ids,
+    __gm__ const int64_t *blocked_slot_ids,
     __gm__ bool *blocked_mask,
     int32_t num_blocked_slot_ids,
     int32_t block_dim) {
@@ -144,10 +144,10 @@ extern "C" __global__ __aicore__ void adapter_mark_blocked_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
-    const __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ bool *blocked_mask,
-    const __gm__ int64_t *search_start,
-    const __gm__ int64_t *selection_state,
+    __gm__ const kvca_slotmeta_t *slot_meta,
+    __gm__ const bool *blocked_mask,
+    __gm__ const int64_t *search_start,
+    __gm__ const int64_t *selection_state,
     __gm__ int64_t *local_count_workspace,
     int32_t num_actual_blocks,
     int32_t threshold,
@@ -161,17 +161,17 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
     const int32_t begin = chunk_begin(num_actual_blocks, core_index, block_dim);
     const int32_t end = chunk_end(num_actual_blocks, core_index, block_dim);
     const int64_t start = search_start[0];
-    const __gm__ uint8_t *blocked_mask_u8 = reinterpret_cast<const __gm__ uint8_t *>(blocked_mask);
+    __gm__ const uint8_t *blocked_mask_u8 = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask);
 
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calc_buf;
     uint32_t buffer_size =
-        ceil_32_bytes(sizeof(kvcache_ops::slotmeta_t) * kMetaTileElems) +
+        ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems) +
         ceil_32_bytes(sizeof(uint8_t) * kMetaTileElems);
     pipe.InitBuffer(calc_buf, buffer_size);
     int32_t offset = 0;
-    auto meta_local = calc_buf.GetWithOffset<kvcache_ops::slotmeta_t>(kMetaTileElems, offset);
-    offset += ceil_32_bytes(sizeof(kvcache_ops::slotmeta_t) * kMetaTileElems);
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, offset);
+    offset += ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems);
     auto blocked_local = calc_buf.GetWithOffset<uint8_t>(kMetaTileElems, offset);
 
     int64_t local_count = 0;
@@ -188,7 +188,7 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
             load_tile(meta_local, slot_meta + tile_begin, tile_len);
             load_tile(blocked_local, blocked_mask_u8 + tile_begin, tile_len);
             for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
-                const kvcache_ops::slotmeta_t meta = meta_local(inner_index);
+                const kvca_slotmeta_t meta = meta_local(inner_index);
                 if (blocked_local(inner_index) == 0 &&
                     unpack_pin_count(meta) == 0 &&
                     unpack_usage_count(meta) == threshold) {
@@ -202,7 +202,7 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_plan_threshold_slots_entry(
-    const __gm__ int64_t *local_count_workspace,
+    __gm__ const int64_t *local_count_workspace,
     __gm__ int64_t *local_offset_workspace,
     __gm__ int64_t *local_emit_workspace,
     __gm__ int64_t *selection_state,
@@ -236,12 +236,12 @@ extern "C" __global__ __aicore__ void adapter_plan_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
-    const __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ bool *blocked_mask,
-    const __gm__ int64_t *search_start,
-    const __gm__ int64_t *selection_state,
-    const __gm__ int64_t *local_offset_workspace,
-    const __gm__ int64_t *local_emit_workspace,
+    __gm__ const kvca_slotmeta_t *slot_meta,
+    __gm__ const bool *blocked_mask,
+    __gm__ const int64_t *search_start,
+    __gm__ const int64_t *selection_state,
+    __gm__ const int64_t *local_offset_workspace,
+    __gm__ const int64_t *local_emit_workspace,
     __gm__ int64_t *selected_slot_ids_out,
     int32_t num_actual_blocks,
     int32_t threshold,
@@ -258,17 +258,17 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
     const int32_t begin = chunk_begin(num_actual_blocks, core_index, block_dim);
     const int32_t end = chunk_end(num_actual_blocks, core_index, block_dim);
     const int64_t start = search_start[0];
-    const __gm__ uint8_t *blocked_mask_u8 = reinterpret_cast<const __gm__ uint8_t *>(blocked_mask);
+    __gm__ const uint8_t *blocked_mask_u8 = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask);
 
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calc_buf;
     uint32_t buffer_size =
-        ceil_32_bytes(sizeof(kvcache_ops::slotmeta_t) * kMetaTileElems) +
+        ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems) +
         ceil_32_bytes(sizeof(uint8_t) * kMetaTileElems);
     pipe.InitBuffer(calc_buf, buffer_size);
     int32_t offset = 0;
-    auto meta_local = calc_buf.GetWithOffset<kvcache_ops::slotmeta_t>(kMetaTileElems, offset);
-    offset += ceil_32_bytes(sizeof(kvcache_ops::slotmeta_t) * kMetaTileElems);
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, offset);
+    offset += ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems);
     auto blocked_local = calc_buf.GetWithOffset<uint8_t>(kMetaTileElems, offset);
 
     int64_t written = 0;
@@ -286,7 +286,7 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
             load_tile(meta_local, slot_meta + tile_begin, tile_len);
             load_tile(blocked_local, blocked_mask_u8 + tile_begin, tile_len);
             for (int32_t inner_index = 0; inner_index < tile_len && written < emit_count; ++inner_index) {
-                const kvcache_ops::slotmeta_t meta = meta_local(inner_index);
+                const kvca_slotmeta_t meta = meta_local(inner_index);
                 if (blocked_local(inner_index) == 0 &&
                     unpack_pin_count(meta) == 0 &&
                     unpack_usage_count(meta) == threshold) {
@@ -300,8 +300,8 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_age_usage_entry(
-    __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *selection_state,
+    __gm__ kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *selection_state,
     int32_t num_actual_blocks,
     int32_t block_dim) {
     const int32_t threshold = static_cast<int32_t>(selection_state[1]);
@@ -318,14 +318,14 @@ extern "C" __global__ __aicore__ void adapter_age_usage_entry(
 
     AscendC::TPipe pipe;
     AscendC::TBuf<AscendC::TPosition::VECCALC> calc_buf;
-    pipe.InitBuffer(calc_buf, ceil_32_bytes(sizeof(kvcache_ops::slotmeta_t) * kMetaTileElems));
-    auto meta_local = calc_buf.GetWithOffset<kvcache_ops::slotmeta_t>(kMetaTileElems, 0);
+    pipe.InitBuffer(calc_buf, ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems));
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, 0);
 
     for (int32_t tile_begin = begin; tile_begin < end; tile_begin += kMetaTileElems) {
         const int32_t tile_len = end - tile_begin > kMetaTileElems ? kMetaTileElems : (end - tile_begin);
         load_tile(meta_local, slot_meta + tile_begin, tile_len);
         for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
-            const kvcache_ops::slotmeta_t meta = meta_local(inner_index);
+            const kvca_slotmeta_t meta = meta_local(inner_index);
             const int32_t pin_count = unpack_pin_count(meta);
             const int32_t usage_count = unpack_usage_count(meta);
             meta_local.SetValue(
@@ -337,7 +337,7 @@ extern "C" __global__ __aicore__ void adapter_age_usage_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_finalize_selected_slots_entry(
-    const __gm__ int64_t *selection_state,
+    __gm__ const int64_t *selection_state,
     __gm__ int64_t *search_start,
     __gm__ int64_t *selected_slot_ids_out,
     int32_t num_actual_blocks,
@@ -358,16 +358,16 @@ extern "C" __global__ __aicore__ void adapter_finalize_selected_slots_entry(
 extern "C" __global__ __aicore__ void adapter_commit_load_metadata_entry(
     __gm__ int64_t *logical_to_physical,
     __gm__ int64_t *physical_to_logical,
-    __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *evicted_logical_block_ids,
+    __gm__ kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *evicted_logical_block_ids,
     int32_t num_evicted,
-    const __gm__ int64_t *miss_logical_block_ids,
-    const __gm__ int64_t *miss_physical_slot_ids,
-    const __gm__ kvcache_ops::slotmeta_t *miss_usage_counts,
+    __gm__ const int64_t *miss_logical_block_ids,
+    __gm__ const int64_t *miss_physical_slot_ids,
+    __gm__ const kvca_slotmeta_t *miss_usage_counts,
     int32_t num_misses,
-    const __gm__ int64_t *hit_slot_ids,
-    const __gm__ int64_t *hit_pin_counts,
-    const __gm__ kvcache_ops::slotmeta_t *hit_usage_counts,
+    __gm__ const int64_t *hit_slot_ids,
+    __gm__ const int64_t *hit_pin_counts,
+    __gm__ const kvca_slotmeta_t *hit_usage_counts,
     int32_t num_hits,
     int32_t block_dim) {
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -400,13 +400,13 @@ extern "C" __global__ __aicore__ void adapter_commit_load_metadata_entry(
 extern "C" __global__ __aicore__ void adapter_commit_save_metadata_entry(
     __gm__ int64_t *logical_to_physical,
     __gm__ int64_t *physical_to_logical,
-    __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *evicted_logical_block_ids,
+    __gm__ kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *evicted_logical_block_ids,
     int32_t num_evicted,
-    const __gm__ int64_t *logical_block_ids,
-    const __gm__ int64_t *physical_slot_ids,
-    const __gm__ int64_t *final_pin_counts,
-    const __gm__ kvcache_ops::slotmeta_t *final_usage_counts,
+    __gm__ const int64_t *logical_block_ids,
+    __gm__ const int64_t *physical_slot_ids,
+    __gm__ const int64_t *final_pin_counts,
+    __gm__ const kvca_slotmeta_t *final_usage_counts,
     int32_t num_slots,
     int32_t block_dim) {
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -431,9 +431,9 @@ extern "C" __global__ __aicore__ void adapter_commit_save_metadata_entry(
 }
 
 extern "C" __global__ __aicore__ void adapter_release_metadata_entry(
-    const __gm__ int64_t *logical_to_physical,
-    __gm__ kvcache_ops::slotmeta_t *slot_meta,
-    const __gm__ int64_t *logical_block_ids,
+    __gm__ const int64_t *logical_to_physical,
+    __gm__ kvca_slotmeta_t *slot_meta,
+    __gm__ const int64_t *logical_block_ids,
     int32_t num_logical_ids,
     int32_t block_dim) {
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -441,7 +441,7 @@ extern "C" __global__ __aicore__ void adapter_release_metadata_entry(
     const int32_t end = chunk_end(num_logical_ids, core_index, block_dim);
     for (int32_t index = begin; index < end; ++index) {
         const int64_t physical_slot_id = logical_to_physical[logical_block_ids[index]];
-        const kvcache_ops::slotmeta_t meta = slot_meta[physical_slot_id];
+        const kvca_slotmeta_t meta = slot_meta[physical_slot_id];
         slot_meta[physical_slot_id] = pack_slot_meta(unpack_pin_count(meta) - 1, unpack_usage_count(meta));
     }
 }
@@ -454,12 +454,12 @@ void adapter_inspect_load_requests_kernel(
     uint32_t block_dim,
     void *stream,
     const int64_t *logical_to_physical,
-    const slotmeta_t *slot_meta,
+    const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
     bool *resident_mask_out,
     int64_t *updated_pin_counts_out,
-    slotmeta_t *updated_usage_counts_out,
+    kvca_slotmeta_t *updated_usage_counts_out,
     int32_t num_logical_ids) {
     adapter_inspect_load_requests_entry<<<block_dim, nullptr, stream>>>(
         logical_to_physical,
@@ -477,11 +477,11 @@ void adapter_inspect_save_requests_kernel(
     uint32_t block_dim,
     void *stream,
     const int64_t *logical_to_physical,
-    const slotmeta_t *slot_meta,
+    const kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int64_t *current_physical_out,
     bool *existing_mask_out,
-    slotmeta_t *final_usage_counts_out,
+    kvca_slotmeta_t *final_usage_counts_out,
     int32_t num_logical_ids) {
     adapter_inspect_save_requests_entry<<<block_dim, nullptr, stream>>>(
         logical_to_physical,
@@ -497,7 +497,7 @@ void adapter_inspect_save_requests_kernel(
 void adapter_pop_reusable_slots_kernel(
     uint32_t block_dim,
     void *stream,
-    slotmeta_t *slot_meta,
+    kvca_slotmeta_t *slot_meta,
     int64_t *search_start,
     const int64_t *blocked_slot_ids,
     bool *blocked_mask,
@@ -564,16 +564,16 @@ void adapter_commit_load_metadata_kernel(
     void *stream,
     int64_t *logical_to_physical,
     int64_t *physical_to_logical,
-    slotmeta_t *slot_meta,
+    kvca_slotmeta_t *slot_meta,
     const int64_t *evicted_logical_block_ids,
     int32_t num_evicted,
     const int64_t *miss_logical_block_ids,
     const int64_t *miss_physical_slot_ids,
-    const slotmeta_t *miss_usage_counts,
+    const kvca_slotmeta_t *miss_usage_counts,
     int32_t num_misses,
     const int64_t *hit_slot_ids,
     const int64_t *hit_pin_counts,
-    const slotmeta_t *hit_usage_counts,
+    const kvca_slotmeta_t *hit_usage_counts,
     int32_t num_hits) {
     adapter_commit_load_metadata_entry<<<block_dim, nullptr, stream>>>(
         logical_to_physical,
@@ -597,13 +597,13 @@ void adapter_commit_save_metadata_kernel(
     void *stream,
     int64_t *logical_to_physical,
     int64_t *physical_to_logical,
-    slotmeta_t *slot_meta,
+    kvca_slotmeta_t *slot_meta,
     const int64_t *evicted_logical_block_ids,
     int32_t num_evicted,
     const int64_t *logical_block_ids,
     const int64_t *physical_slot_ids,
     const int64_t *final_pin_counts,
-    const slotmeta_t *final_usage_counts,
+    const kvca_slotmeta_t *final_usage_counts,
     int32_t num_slots) {
     adapter_commit_save_metadata_entry<<<block_dim, nullptr, stream>>>(
         logical_to_physical,
@@ -623,7 +623,7 @@ void adapter_release_metadata_kernel(
     uint32_t block_dim,
     void *stream,
     const int64_t *logical_to_physical,
-    slotmeta_t *slot_meta,
+    kvca_slotmeta_t *slot_meta,
     const int64_t *logical_block_ids,
     int32_t num_logical_ids) {
     adapter_release_metadata_entry<<<block_dim, nullptr, stream>>>(
