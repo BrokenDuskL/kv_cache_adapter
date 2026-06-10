@@ -187,27 +187,34 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         )
         subprocess.run(" ".join(cmake_parts), cwd=ROOT_DIR, shell=True, check=True, text=True)
 
-        output_dir = Path(os.path.dirname(self.get_ext_fullpath(ext.name)))
+        expected_ext_path = Path(self.get_ext_fullpath(ext.name))
+        output_dir = expected_ext_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
-        patterns = (
-            f"{ext.name}*.so",
-            "libkv_cache_adapter_npu_custom_kernels.so",
-        )
-        copied_any = False
+        copied_extension = False
+        copied_support_lib = False
         for search_root in (install_root, install_root / "lib", install_root / "lib64"):
             if not search_root.exists():
                 continue
-            for pattern in patterns:
-                for src_path in glob.glob(str(search_root / pattern)):
-                    dst_path = output_dir / os.path.basename(src_path)
-                    if os.path.abspath(src_path) != os.path.abspath(dst_path):
-                        shutil.copy2(src_path, dst_path)
-                    if self.inplace:
-                        source_dst = ROOT_DIR / os.path.basename(src_path)
-                        if os.path.abspath(src_path) != os.path.abspath(source_dst):
-                            shutil.copy2(src_path, source_dst)
-                    copied_any = True
-        if not copied_any:
+            for src_path in glob.glob(str(search_root / f"{ext.name}*.so")):
+                src = Path(src_path)
+                shutil.copy2(src, expected_ext_path)
+                if self.inplace:
+                    shutil.copy2(src, ROOT_DIR / expected_ext_path.name)
+                copied_extension = True
+                break
+            support_lib = search_root / "libkv_cache_adapter_npu_custom_kernels.so"
+            if support_lib.exists():
+                dst_path = output_dir / support_lib.name
+                if os.path.abspath(support_lib) != os.path.abspath(dst_path):
+                    shutil.copy2(support_lib, dst_path)
+                if self.inplace:
+                    source_dst = ROOT_DIR / support_lib.name
+                    if os.path.abspath(support_lib) != os.path.abspath(source_dst):
+                        shutil.copy2(support_lib, source_dst)
+                copied_support_lib = True
+            if copied_extension and copied_support_lib:
+                break
+        if not copied_extension:
             raise RuntimeError(f"Failed to locate built shared libraries for {ext.name}")
 
 
