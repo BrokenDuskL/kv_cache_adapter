@@ -16,13 +16,22 @@ _EXPORTS = (
     "commit_save_metadata",
     "release_metadata",
 )
+_SUPPORT_LIB_NAME = "libkv_cache_adapter_npu_custom_kernels.so"
+
+
+def _preload_support_lib(module_dir: pathlib.Path) -> None:
+    support_lib = module_dir / _SUPPORT_LIB_NAME
+    if not support_lib.exists():
+        raise ImportError(
+            f"missing required sibling library {support_lib}; rebuild with python setup.py build_ext --inplace "
+            "or reinstall the package so the sidecar .so is copied next to kv_cache_adapter_npu_custom_ops",
+        )
+    ctypes.CDLL(str(support_lib), mode=ctypes.RTLD_GLOBAL)
 
 
 def _load_ops_module():
     module_dir = pathlib.Path(__file__).resolve().parent
-    support_lib = module_dir / "libkv_cache_adapter_npu_custom_kernels.so"
-    if support_lib.exists():
-        ctypes.CDLL(str(support_lib), mode=ctypes.RTLD_GLOBAL)
+    _preload_support_lib(module_dir)
     direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
     if direct_spec is not None and direct_spec.loader is not None:
         module = importlib.util.module_from_spec(direct_spec)

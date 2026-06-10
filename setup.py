@@ -1,5 +1,4 @@
 import configparser
-import glob
 import importlib.util
 import os
 import platform
@@ -116,7 +115,8 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         super().build_extension(ext)
 
     def _build_cmake_extension(self, ext: CMakeExtension) -> None:
-        build_root = ROOT_DIR / "build" / ext.name
+        module_basename = ext.name.rsplit(".", 1)[-1]
+        build_root = ROOT_DIR / "build" / module_basename
         install_root = build_root / "install"
         if build_root.exists():
             shutil.rmtree(build_root)
@@ -190,33 +190,27 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         expected_ext_path = Path(self.get_ext_fullpath(ext.name))
         output_dir = expected_ext_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
-        module_basename = ext.name.rsplit(".", 1)[-1]
-        copied_extension = False
-        copied_support_lib = False
-        for search_root in (install_root, install_root / "lib", install_root / "lib64"):
-            if not search_root.exists():
-                continue
-            for src_path in glob.glob(str(search_root / f"{module_basename}*.so")):
-                src = Path(src_path)
-                shutil.copy2(src, expected_ext_path)
-                if self.inplace:
-                    shutil.copy2(src, ROOT_DIR / expected_ext_path.name)
-                copied_extension = True
-                break
-            support_lib = search_root / "libkv_cache_adapter_npu_custom_kernels.so"
-            if support_lib.exists():
-                dst_path = output_dir / support_lib.name
-                if os.path.abspath(support_lib) != os.path.abspath(dst_path):
-                    shutil.copy2(support_lib, dst_path)
-                if self.inplace:
-                    source_dst = ROOT_DIR / support_lib.name
-                    if os.path.abspath(support_lib) != os.path.abspath(source_dst):
-                        shutil.copy2(support_lib, source_dst)
-                copied_support_lib = True
-            if copied_extension and copied_support_lib:
-                break
-        if not copied_extension:
-            raise RuntimeError(f"Failed to locate built shared libraries for {ext.name}")
+        built_modules = sorted(install_root.glob(f"{module_basename}*.so"))
+        if not built_modules:
+            raise RuntimeError(f"Failed to locate built extension for {ext.name} under {install_root}")
+        built_extension = built_modules[0]
+        shutil.copy2(built_extension, expected_ext_path)
+        if self.inplace:
+            shutil.copy2(built_extension, ROOT_DIR / expected_ext_path.name)
+
+        support_lib = install_root / "lib" / "libkv_cache_adapter_npu_custom_kernels.so"
+        if not support_lib.exists():
+            raise RuntimeError(
+                f"Failed to locate required support library {support_lib} for {ext.name}; "
+                "the build must place this sidecar next to the Python extension output",
+            )
+        dst_path = output_dir / support_lib.name
+        if os.path.abspath(support_lib) != os.path.abspath(dst_path):
+            shutil.copy2(support_lib, dst_path)
+        if self.inplace:
+            source_dst = ROOT_DIR / support_lib.name
+            if os.path.abspath(support_lib) != os.path.abspath(source_dst):
+                shutil.copy2(support_lib, source_dst)
 
 
 ext_modules: list[Extension] = [

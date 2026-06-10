@@ -545,6 +545,7 @@ def test_load_npu_extension_prefers_custom_wrapper(monkeypatch: pytest.MonkeyPat
 def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
     imported_modules: list[str] = []
+    support_lib = wrapper_path.with_name("libkv_cache_adapter_npu_custom_kernels.so")
 
     class _StandaloneLoader:
         def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
@@ -569,6 +570,13 @@ def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPat
             raise AssertionError("local wrapper should not resolve ops via global import_module")
         return real_import(name)
 
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(path: pathlib.Path) -> bool:
+        if path == support_lib:
+            return True
+        return real_exists(path)
+
     def fake_find_spec(
         fullname: str,
         path: list[str] | None = None,
@@ -582,6 +590,8 @@ def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
     monkeypatch.setattr(adapter_module.importlib.machinery.PathFinder, "find_spec", fake_find_spec)
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    monkeypatch.setattr(adapter_module.ctypes, "CDLL", lambda *args, **kwargs: object())
     spec = importlib.util.spec_from_file_location("kv_cache_adapter_npu_custom_test", wrapper_path)
     assert spec is not None
     assert spec.loader is not None
@@ -596,6 +606,7 @@ def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPat
 def test_packaged_npu_custom_wrapper_prefers_sibling_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
     imported_modules: list[str] = []
+    support_lib = wrapper_path.with_name("libkv_cache_adapter_npu_custom_kernels.so")
 
     class _StandaloneLoader:
         def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
@@ -620,6 +631,13 @@ def test_packaged_npu_custom_wrapper_prefers_sibling_ops(monkeypatch: pytest.Mon
             raise AssertionError("packaged wrapper should prefer sibling ops before qualified import")
         return real_import(name)
 
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(path: pathlib.Path) -> bool:
+        if path == support_lib:
+            return True
+        return real_exists(path)
+
     def fake_find_spec(
         fullname: str,
         path: list[str] | None = None,
@@ -633,6 +651,8 @@ def test_packaged_npu_custom_wrapper_prefers_sibling_ops(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(adapter_module.importlib, "import_module", fake_import)
     monkeypatch.setattr(adapter_module.importlib.machinery.PathFinder, "find_spec", fake_find_spec)
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    monkeypatch.setattr(adapter_module.ctypes, "CDLL", lambda *args, **kwargs: object())
     package_module = types.ModuleType("kv_cache_adapter")
     package_module.__path__ = [str(wrapper_path.parent)]  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "kv_cache_adapter", package_module)
@@ -645,3 +665,52 @@ def test_packaged_npu_custom_wrapper_prefers_sibling_ops(monkeypatch: pytest.Mon
 
     assert module.inspect_load_requests(1, 2) == ("inspect_load_requests", (1, 2))
     assert "kv_cache_adapter.kv_cache_adapter_npu_custom_ops" not in imported_modules
+
+
+def test_npu_custom_wrapper_requires_sibling_support_lib(monkeypatch: pytest.MonkeyPatch) -> None:
+    wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
+    sibling_support_lib = wrapper_path.with_name("libkv_cache_adapter_npu_custom_kernels.so")
+
+    class _StandaloneLoader:
+        def create_module(self, spec: importlib.machinery.ModuleSpec) -> None:
+            del spec
+            return None
+
+        def exec_module(self, module: types.ModuleType) -> None:
+            module.inspect_load_requests = lambda *args: ("inspect_load_requests", args)
+            module.inspect_save_requests = lambda *args: ("inspect_save_requests", args)
+            module.pop_reusable_slots = lambda *args: ("pop_reusable_slots", args)
+            module.commit_load_metadata = lambda *args: ("commit_load_metadata", args)
+            module.commit_save_metadata = lambda *args: ("commit_save_metadata", args)
+            module.release_metadata = lambda *args: ("release_metadata", args)
+
+    real_find_spec = adapter_module.importlib.machinery.PathFinder.find_spec
+
+    def fake_find_spec(
+        fullname: str,
+        path: list[str] | None = None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        del target
+        if fullname == "kv_cache_adapter_npu_custom_ops":
+            return importlib.machinery.ModuleSpec(fullname, _StandaloneLoader(), origin=str(wrapper_path.parent))
+        return real_find_spec(fullname, path)
+
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(path: pathlib.Path) -> bool:
+        if path == sibling_support_lib:
+            return True
+        return real_exists(path)
+
+    monkeypatch.setattr(adapter_module.importlib.machinery.PathFinder, "find_spec", fake_find_spec)
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    monkeypatch.setattr(adapter_module.ctypes, "CDLL", lambda *args, **kwargs: object())
+    spec = importlib.util.spec_from_file_location("kv_cache_adapter_npu_custom_candidates", wrapper_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with pytest.raises(ImportError, match="missing required sibling library"):
+        module._preload_support_lib(pathlib.Path("/tmp/kvca"))
