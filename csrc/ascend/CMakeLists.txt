@@ -80,8 +80,12 @@ target_link_libraries(kv_cache_adapter_npu_custom_ops
   tiling_api
 )
 
-install(TARGETS
-  kv_cache_adapter_npu_custom_ops
-  kv_cache_adapter_npu_custom_kernels
-  DESTINATION ${CMAKE_INSTALL_PREFIX}
+install(TARGETS kv_cache_adapter_npu_custom_ops
+  LIBRARY DESTINATION .
+  RUNTIME DESTINATION .
+)
+
+install(TARGETS kv_cache_adapter_npu_custom_kernels
+  LIBRARY DESTINATION .
+  RUNTIME DESTINATION .
 )

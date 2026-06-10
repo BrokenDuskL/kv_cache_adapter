@@ -198,11 +198,11 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         if self.inplace:
             shutil.copy2(built_extension, ROOT_DIR / expected_ext_path.name)
 
-        support_lib = install_root / "lib" / "libkv_cache_adapter_npu_custom_kernels.so"
+        support_lib = install_root / "libkv_cache_adapter_npu_custom_kernels.so"
         if not support_lib.exists():
             raise RuntimeError(
                 f"Failed to locate required support library {support_lib} for {ext.name}; "
-                "the build must place this sidecar next to the Python extension output",
+                "the build must place this sidecar in the install root next to the Python extension output",
             )
         dst_path = output_dir / support_lib.name
         if os.path.abspath(support_lib) != os.path.abspath(dst_path):
