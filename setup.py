@@ -190,12 +190,13 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         expected_ext_path = Path(self.get_ext_fullpath(ext.name))
         output_dir = expected_ext_path.parent
         output_dir.mkdir(parents=True, exist_ok=True)
+        module_basename = ext.name.rsplit(".", 1)[-1]
         copied_extension = False
         copied_support_lib = False
         for search_root in (install_root, install_root / "lib", install_root / "lib64"):
             if not search_root.exists():
                 continue
-            for src_path in glob.glob(str(search_root / f"{ext.name}*.so")):
+            for src_path in glob.glob(str(search_root / f"{module_basename}*.so")):
                 src = Path(src_path)
                 shutil.copy2(src, expected_ext_path)
                 if self.inplace:
@@ -220,7 +221,7 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
 
 ext_modules: list[Extension] = [
     CppExtension(
-        name="kv_cache_adapter_npu",
+        name="kv_cache_adapter.kv_cache_adapter_npu",
         sources=["csrc/kv_adapter_npu.cpp"],
         extra_compile_args=[f"-DKVCA_SLOT_META_BITS={KVCA_SLOT_META_BITS}", "-O3"],
     ),
@@ -229,7 +230,7 @@ ext_modules: list[Extension] = [
 if CUDA_HOME is not None and os.path.exists("csrc/kv_adapter_cuda.cu"):
     ext_modules.append(
         CUDAExtension(
-            name="kv_cache_adapter_cuda",
+            name="kv_cache_adapter.kv_cache_adapter_cuda",
             sources=[
                 "csrc/binding.cpp",
                 "csrc/kv_adapter_cuda.cu",
@@ -244,7 +245,7 @@ if CUDA_HOME is not None and os.path.exists("csrc/kv_adapter_cuda.cu"):
 if _should_build_ascend_extension():
     ext_modules.append(
         CMakeExtension(
-            name="kv_cache_adapter_npu_custom_ops",
+            name="kv_cache_adapter.kv_cache_adapter_npu_custom_ops",
             cmake_lists_dir=str(ROOT_DIR / "csrc" / "ascend"),
         ),
     )
@@ -252,6 +253,10 @@ if _should_build_ascend_extension():
 
 setup(
     name="kv_cache_adapter",
+    packages=["kv_cache_adapter"],
+    package_dir={"kv_cache_adapter": "."},
+    package_data={"kv_cache_adapter": ["*.so"]},
+    include_package_data=True,
     ext_modules=ext_modules,
     cmdclass={"build_ext": KVCacheAdapterBuildExtension},
 )

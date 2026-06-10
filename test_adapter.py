@@ -505,9 +505,9 @@ def test_load_npu_extension_prefers_custom_wrapper(monkeypatch: pytest.MonkeyPat
 
     def fake_import(name: str, package: str | None = None) -> object:
         del package
-        if name == "kv_cache_adapter_npu_custom":
+        if name in {"kv_cache_adapter_npu_custom", "kv_cache_adapter.kv_cache_adapter_npu_custom"}:
             return custom_module
-        if name == "kv_cache_adapter_npu":
+        if name in {"kv_cache_adapter_npu", "kv_cache_adapter.kv_cache_adapter_npu"}:
             return legacy_module
         raise ImportError(name)
 
@@ -534,7 +534,7 @@ def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPat
     def fake_import(name: str, package: str | None = None) -> object:
         del package
         imported_modules.append(name)
-        if name == "kv_cache_adapter_npu_custom_ops":
+        if name in {"kv_cache_adapter_npu_custom_ops", "kv_cache_adapter.kv_cache_adapter_npu_custom_ops"}:
             return standalone_ops
         return real_import(name)
 

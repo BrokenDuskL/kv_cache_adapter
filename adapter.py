@@ -1323,18 +1323,35 @@ class _NoopMemoryAllocator:
 
 @lru_cache(maxsize=1)
 def _load_cuda_extension_module() -> Any | None:
-    try:
-        return importlib.import_module("kv_cache_adapter_cuda")
-    except Exception:
-        return None
+    module_names = []
+    if __package__:
+        module_names.append(f"{__package__}.kv_cache_adapter_cuda")
+    module_names.append("kv_cache_adapter_cuda")
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            continue
+    return None
 
 
 @lru_cache(maxsize=1)
 def _load_npu_extension_module() -> Any | None:
-    try:
-        return importlib.import_module("kv_cache_adapter_npu_custom")
-    except Exception:
-        return None
+    module_names = []
+    if __package__:
+        module_names.extend(
+            [
+                f"{__package__}.kv_cache_adapter_npu_custom",
+                f"{__package__}.kv_cache_adapter_npu",
+            ],
+        )
+    module_names.extend(["kv_cache_adapter_npu_custom", "kv_cache_adapter_npu"])
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            continue
+    return None
 
 
 @lru_cache(maxsize=1)
