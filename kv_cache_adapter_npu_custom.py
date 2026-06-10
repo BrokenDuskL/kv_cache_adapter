@@ -23,28 +23,27 @@ def _load_ops_module():
     support_lib = module_dir / "libkv_cache_adapter_npu_custom_kernels.so"
     if support_lib.exists():
         ctypes.CDLL(str(support_lib), mode=ctypes.RTLD_GLOBAL)
-    module_names = []
     if __package__:
-        module_names.append(f"{__package__}.kv_cache_adapter_npu_custom_ops")
-    module_names.append("kv_cache_adapter_npu_custom_ops")
-    try:
-        module = None
-        for module_name in module_names:
-            try:
-                module = importlib.import_module(module_name)
-                break
-            except Exception:
-                continue
-        if module is None:
-            raise ImportError("kv_cache_adapter_npu_custom_ops is not available")
-    except Exception:
+        qualified_name = f"{__package__}.kv_cache_adapter_npu_custom_ops"
+        try:
+            module = importlib.import_module(qualified_name)
+        except Exception:
+            direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
+            if direct_spec is None or direct_spec.loader is None:  # pragma: no cover - depends on Ascend runtime
+                raise
+            module = importlib.util.module_from_spec(direct_spec)
+            sys.modules[qualified_name] = module
+            sys.modules.setdefault("kv_cache_adapter_npu_custom_ops", module)
+            direct_spec.loader.exec_module(module)
+    else:
         direct_spec = importlib.machinery.PathFinder.find_spec("kv_cache_adapter_npu_custom_ops", [str(module_dir)])
         if direct_spec is None or direct_spec.loader is None:  # pragma: no cover - depends on Ascend runtime
-            raise
+            raise ImportError(
+                f"kv_cache_adapter_npu_custom_ops not found next to {__file__}; rebuild with "
+                "python setup.py build_ext --inplace or install the package",
+            )
         module = importlib.util.module_from_spec(direct_spec)
-        if __package__:
-            sys.modules.setdefault(f"{__package__}.kv_cache_adapter_npu_custom_ops", module)
-        sys.modules.setdefault("kv_cache_adapter_npu_custom_ops", module)
+        sys.modules["kv_cache_adapter_npu_custom_ops"] = module
         direct_spec.loader.exec_module(module)
     missing_exports = [name for name in _EXPORTS if not hasattr(module, name)]
     if missing_exports:  # pragma: no cover - depends on Ascend runtime
