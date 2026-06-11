@@ -248,6 +248,7 @@ torch::Tensor pop_reusable_slots(
   auto local_emit_workspace = torch::zeros({block_dim}, search_start.options());
   const c10::OptionalDeviceGuard device_guard(slot_meta.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const bool trace = debug_trace_enabled();
   debug_log(
       "pop_reusable_slots:launch",
       "slot_meta=" + summarize_tensor(slot_meta) +
@@ -255,16 +256,14 @@ torch::Tensor pop_reusable_slots(
           " blocked_slot_ids=" + summarize_tensor(blocked_slot_ids) +
           " count=" + std::to_string(count) +
           " block_dim=" + std::to_string(block_dim));
-  at_npu::native::OpCommand cmd;
-  cmd.Name("kv_cache_adapter_pop_reusable_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  auto run_pop_reusable_slots = [&](bool emit_trace) {
     kvcache_ops::adapter_mark_blocked_slots_kernel(
         block_dim,
         stream,
         blocked_slot_ids.data_ptr<int64_t>(),
         blocked_mask.data_ptr<uint8_t>(),
         static_cast<int32_t>(blocked_slot_ids.numel()));
-    if (debug_trace_enabled()) {
+    if (emit_trace) {
       debug_sync_stream(stream, "pop_reusable_slots:after_mark_blocked");
       debug_log("pop_reusable_slots:after_mark_blocked", "blocked_mask=" + summarize_tensor(blocked_mask));
     }
@@ -279,7 +278,7 @@ torch::Tensor pop_reusable_slots(
           local_count_workspace.data_ptr<int64_t>(),
           static_cast<int32_t>(slot_meta.numel()),
           threshold);
-      if (debug_trace_enabled()) {
+      if (emit_trace) {
         debug_sync_stream(stream, "pop_reusable_slots:after_count_threshold");
         debug_log(
             "pop_reusable_slots:after_count_threshold",
@@ -296,7 +295,7 @@ torch::Tensor pop_reusable_slots(
           static_cast<int32_t>(block_dim),
           static_cast<int32_t>(count),
           threshold);
-      if (debug_trace_enabled()) {
+      if (emit_trace) {
         debug_sync_stream(stream, "pop_reusable_slots:after_plan_threshold");
         debug_log(
             "pop_reusable_slots:after_plan_threshold",
@@ -317,7 +316,7 @@ torch::Tensor pop_reusable_slots(
           selected_slot_ids.data_ptr<int64_t>(),
           static_cast<int32_t>(slot_meta.numel()),
           threshold);
-      if (debug_trace_enabled()) {
+      if (emit_trace) {
         debug_sync_stream(stream, "pop_reusable_slots:after_collect_threshold");
         debug_log(
             "pop_reusable_slots:after_collect_threshold",
@@ -325,7 +324,7 @@ torch::Tensor pop_reusable_slots(
                 " selection_state=" + summarize_tensor(selection_state) +
                 " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
       }
-      if (debug_trace_enabled() && selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
+      if (emit_trace && selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
         break;
       }
     }
@@ -335,7 +334,7 @@ torch::Tensor pop_reusable_slots(
         slot_meta.data_ptr<kvca_slotmeta_t>(),
         selection_state.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()));
-    if (debug_trace_enabled()) {
+    if (emit_trace) {
       debug_sync_stream(stream, "pop_reusable_slots:after_age_usage");
       debug_log(
           "pop_reusable_slots:after_age_usage",
@@ -349,7 +348,7 @@ torch::Tensor pop_reusable_slots(
         selected_slot_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()),
         static_cast<int32_t>(count));
-    if (debug_trace_enabled()) {
+    if (emit_trace) {
       debug_sync_stream(stream, "pop_reusable_slots:after_finalize");
       debug_log(
           "pop_reusable_slots:after_finalize",
@@ -357,9 +356,52 @@ torch::Tensor pop_reusable_slots(
               " search_start=" + summarize_tensor(search_start) +
               " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
     }
-    return 0;
-  });
-  cmd.Run();
+  };
+  if (trace) {
+    run_pop_reusable_slots(true);
+  } else {
+    at_npu::native::OpCommand cmd;
+    cmd.Name("kv_cache_adapter_pop_reusable_slots");
+    cmd.SetCustomHandler([&]() -> int {
+      run_pop_reusable_slots(false);
+      return 0;
+    });
+    cmd.Run();
+  }
+  if (trace) {
+    const auto selection_state_cpu = selection_state.to(torch::kCPU);
+    const int64_t selected_count = selection_state_cpu[0].item<int64_t>();
+    const int64_t selected_threshold = selection_state_cpu[1].item<int64_t>();
+    const auto selected_slot_ids_cpu = selected_slot_ids.to(torch::kCPU);
+    int64_t invalid_index = -1;
+    int64_t invalid_value = 0;
+    for (int64_t index = 0; index < selected_slot_ids_cpu.numel(); ++index) {
+      const int64_t slot_id = selected_slot_ids_cpu[index].item<int64_t>();
+      if (slot_id < 0 || slot_id >= slot_meta.numel()) {
+        invalid_index = index;
+        invalid_value = slot_id;
+        break;
+      }
+    }
+    TORCH_CHECK(
+        selected_count == count && invalid_index < 0,
+        "pop_reusable_slots failed to select valid slots: selected_count=",
+        selected_count,
+        ", selected_threshold=",
+        selected_threshold,
+        ", count=",
+        count,
+        ", invalid_index=",
+        invalid_index,
+        ", invalid_value=",
+        invalid_value,
+        ", selected_slot_ids=",
+        summarize_tensor(selected_slot_ids),
+        ", slot_meta=",
+        summarize_tensor(slot_meta),
+        ", blocked_slot_ids=",
+        summarize_tensor(blocked_slot_ids));
+  }
   debug_sync_stream(stream, "pop_reusable_slots:done");
   debug_log(
       "pop_reusable_slots:state",

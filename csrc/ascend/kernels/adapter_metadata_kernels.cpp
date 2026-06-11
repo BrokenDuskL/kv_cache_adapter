@@ -4,6 +4,8 @@
 
 namespace {
 
+using namespace AscendC;
+
 constexpr int32_t kMetaTileElems = 256;
 
 __aicore__ inline int32_t chunk_begin(int32_t total, int32_t core_index, int32_t core_count) {
@@ -26,6 +28,7 @@ __aicore__ inline void load_tile(
     AscendC::GlobalTensor<T> global_tensor;
     global_tensor.SetGlobalBuffer(const_cast<__gm__ T *>(global_ptr), len);
     AscendC::DataCopy(local_tensor, global_tensor, len);
+    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename T>
@@ -35,7 +38,9 @@ __aicore__ inline void store_tile(
     int32_t len) {
     AscendC::GlobalTensor<T> global_tensor;
     global_tensor.SetGlobalBuffer(global_ptr, len);
+    PipeBarrier<PIPE_ALL>();
     AscendC::DataCopy(global_tensor, local_tensor, len);
+    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename T>
