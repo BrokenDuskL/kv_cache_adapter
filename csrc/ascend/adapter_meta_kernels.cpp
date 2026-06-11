@@ -125,11 +125,11 @@ void check_same_device(
 }
 
 uint32_t block_dim_for(int64_t count) {
-  if (count <= 0) {
-    return 1;
-  }
-  constexpr int64_t kMaxBlocks = 32;
-  return static_cast<uint32_t>(count < kMaxBlocks ? count : kMaxBlocks);
+  (void)count;
+  // The Ascend metadata kernels are currently correctness-sensitive to the
+  // block partitioning path; run them on a single block until the multi-block
+  // partition logic is proven correct on hardware.
+  return 1;
 }
 
 }  // namespace
