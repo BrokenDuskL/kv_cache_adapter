@@ -45,6 +45,42 @@ STATE_NAMES = {
     STATE_LOADING: "loading",
     STATE_RESIDENT: "resident",
 }
+_DEBUG_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _debug_trace_enabled() -> bool:
+    return os.getenv("KVCA_DEBUG_TRACE", "").strip().lower() in _DEBUG_TRUE_VALUES
+
+
+def _debug_format_value(value: Any) -> str:
+    if isinstance(value, torch.Tensor):
+        summary = f"shape={tuple(value.shape)},dtype={value.dtype},device={value.device}"
+        if value.ndim <= 1 and value.numel() <= 16:
+            try:
+                return f"{summary},values={value.detach().cpu().tolist()}"
+            except Exception:
+                return summary
+        return summary
+    return str(value)
+
+
+def _debug_log(stage: str, **fields: Any) -> None:
+    if not _debug_trace_enabled():
+        return
+    suffix = ""
+    if fields:
+        suffix = " " + ", ".join(f"{key}={_debug_format_value(value)}" for key, value in fields.items())
+    print(f"[kvca-debug] {stage}{suffix}", file=sys.stderr, flush=True)
+
+
+def _debug_sync(device: torch.device, *, stage: str) -> None:
+    if not _debug_trace_enabled():
+        return
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type in {"npu", "privateuseone"} and hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    _debug_log(f"{stage}:synchronized")
 
 
 class KVCacheAdapterError(RuntimeError):
@@ -218,16 +254,36 @@ class KVCacheAdapter:
         if logical_block_ids.numel() == 0:
             return
 
+        _debug_log(
+            "save:start",
+            logical_block_ids=logical_block_ids,
+            block_data=block_data,
+            runtime_path=self.runtime_path,
+        )
         current_physical, existing_mask, _ = self._inspect_save_requests(logical_block_ids)
+        _debug_log(
+            "save:after_inspect_save_requests",
+            current_physical=current_physical,
+            existing_mask=existing_mask,
+        )
         existing_positions = _selected_positions(existing_mask)
         missing_positions = _unselected_positions(existing_mask)
         existing_physical = current_physical.index_select(0, existing_positions)
         missing_ids = logical_block_ids.index_select(0, missing_positions)
+        _debug_log(
+            "save:partitioned_requests",
+            existing_positions=existing_positions,
+            missing_positions=missing_positions,
+            existing_physical=existing_physical,
+            missing_ids=missing_ids,
+        )
         allocated_physical = self._pop_reusable_slots(missing_ids.shape[0], blocked_slot_ids=existing_physical)
+        _debug_log("save:after_pop_reusable_slots", allocated_physical=allocated_physical)
 
         selected_physical = current_physical.clone()
         if missing_ids.numel() > 0:
             selected_physical.index_copy_(0, missing_positions, allocated_physical)
+        _debug_log("save:selected_physical", selected_physical=selected_physical)
 
         final_pin_counts = self._pin_count.index_select(0, selected_physical)
         final_usage_counts = torch.ones_like(logical_block_ids, dtype=USAGE_DTYPE)
@@ -237,12 +293,27 @@ class KVCacheAdapter:
                 existing_positions,
                 _saturating_increment_usage(self._usage_count.index_select(0, existing_physical)),
             )
+        _debug_log(
+            "save:final_metadata",
+            final_pin_counts=final_pin_counts,
+            final_usage_counts=final_usage_counts,
+        )
         eviction_plan = self._build_eviction_plan(logical_block_ids, selected_physical)
+        _debug_log(
+            "save:eviction_plan",
+            eviction_logical_block_ids=eviction_plan.logical_block_ids,
+            eviction_payloads=eviction_plan.payloads,
+        )
 
         if eviction_plan.logical_block_ids.numel() > 0:
+            _debug_log("save:before_backend_save", logical_block_ids=eviction_plan.logical_block_ids)
             self.backend.save_blocks(eviction_plan.logical_block_ids, eviction_plan.payloads)
+            _debug_sync(self.actual_blocks.device, stage="save:after_backend_save")
 
+        _debug_log("save:before_copy_into_actual_blocks", physical_slot_ids=selected_physical)
         self._copy_into_actual_blocks(selected_physical, block_data)
+        _debug_sync(self.actual_blocks.device, stage="save:after_copy_into_actual_blocks")
+        _debug_log("save:before_commit_save_metadata")
         self._commit_save_metadata(
             evicted_logical_block_ids=eviction_plan.logical_block_ids,
             logical_block_ids=logical_block_ids,
@@ -250,6 +321,7 @@ class KVCacheAdapter:
             final_pin_counts=final_pin_counts,
             final_usage_counts=final_usage_counts,
         )
+        _debug_log("save:done")
 
     def load(self, logical_block_ids: torch.Tensor) -> torch.Tensor:
         _require_id_tensor(logical_block_ids, name="logical_block_ids")
@@ -258,24 +330,44 @@ class KVCacheAdapter:
         if logical_block_ids.numel() == 0:
             return torch.empty_like(logical_block_ids)
 
+        _debug_log("load:start", logical_block_ids=logical_block_ids, runtime_path=self.runtime_path)
         current_physical, resident_mask, updated_pin_counts, _ = self._inspect_load_requests(
             logical_block_ids,
+        )
+        _debug_log(
+            "load:after_inspect_load_requests",
+            current_physical=current_physical,
+            resident_mask=resident_mask,
+            updated_pin_counts=updated_pin_counts,
         )
         resident_positions = _selected_positions(resident_mask)
         miss_positions = _unselected_positions(resident_mask)
         hit_slot_ids = current_physical.index_select(0, resident_positions)
         miss_logical_ids = logical_block_ids.index_select(0, miss_positions)
         miss_physical_slot_ids = self._pop_reusable_slots(miss_logical_ids.shape[0], blocked_slot_ids=hit_slot_ids)
+        _debug_log(
+            "load:resolved_slots",
+            resident_positions=resident_positions,
+            miss_positions=miss_positions,
+            hit_slot_ids=hit_slot_ids,
+            miss_logical_ids=miss_logical_ids,
+            miss_physical_slot_ids=miss_physical_slot_ids,
+        )
         eviction_plan = self._build_eviction_plan(miss_logical_ids, miss_physical_slot_ids)
+        _debug_log("load:eviction_plan", eviction_logical_block_ids=eviction_plan.logical_block_ids)
 
         if eviction_plan.logical_block_ids.numel() > 0:
+            _debug_log("load:before_backend_save", logical_block_ids=eviction_plan.logical_block_ids)
             self.backend.save_blocks(eviction_plan.logical_block_ids, eviction_plan.payloads)
+            _debug_sync(self.actual_blocks.device, stage="load:after_backend_save")
         if miss_logical_ids.numel() > 0:
+            _debug_log("load:before_backend_load", logical_block_ids=miss_logical_ids)
             self.backend.load_blocks(
                 miss_logical_ids,
                 self.actual_blocks,
                 miss_physical_slot_ids,
             )
+            _debug_sync(self.actual_blocks.device, stage="load:after_backend_load")
 
         hit_usage_counts = _saturating_increment_usage(
             self._usage_count.index_select(0, hit_slot_ids),
@@ -294,6 +386,7 @@ class KVCacheAdapter:
             hit_usage_counts=hit_usage_counts,
             miss_usage_counts=miss_usage_counts,
         )
+        _debug_log("load:done")
         return self._logical_to_physical.index_select(0, logical_block_ids)
 
     def release(self, logical_block_ids: torch.Tensor) -> None:
@@ -386,13 +479,23 @@ class KVCacheAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._native_ext is not None:
             if self._platform == "npu":
-                return tuple(
+                _debug_log("npu:inspect_load_requests:launch", logical_block_ids=logical_block_ids)
+                result = tuple(
                     self._native_ext.inspect_load_requests(
                         self._logical_to_physical.contiguous(),
                         self._slot_meta.contiguous(),
                         logical_block_ids.contiguous(),
                     ),
                 )  # type: ignore[return-value]
+                _debug_sync(self.actual_blocks.device, stage="npu:inspect_load_requests")
+                _debug_log(
+                    "npu:inspect_load_requests:done",
+                    current_physical=result[0],
+                    resident_mask=result[1],
+                    updated_pin_counts=result[2],
+                    updated_usage_counts=result[3],
+                )
+                return result
             return tuple(
                 self._native_ext.inspect_load_requests(
                     self._logical_to_physical.contiguous(),
@@ -425,13 +528,22 @@ class KVCacheAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._native_ext is not None:
             if self._platform == "npu":
-                return tuple(
+                _debug_log("npu:inspect_save_requests:launch", logical_block_ids=logical_block_ids)
+                result = tuple(
                     self._native_ext.inspect_save_requests(
                         self._logical_to_physical.contiguous(),
                         self._slot_meta.contiguous(),
                         logical_block_ids.contiguous(),
                     ),
                 )  # type: ignore[return-value]
+                _debug_sync(self.actual_blocks.device, stage="npu:inspect_save_requests")
+                _debug_log(
+                    "npu:inspect_save_requests:done",
+                    current_physical=result[0],
+                    existing_mask=result[1],
+                    final_usage_counts=result[2],
+                )
+                return result
             return tuple(
                 self._native_ext.inspect_save_requests(
                     self._logical_to_physical.contiguous(),
@@ -464,12 +576,21 @@ class KVCacheAdapter:
         blocked_slot_ids = blocked_slot_ids.contiguous()
         if self._native_ext is not None:
             if self._platform == "npu":
-                return self._native_ext.pop_reusable_slots(
+                _debug_log(
+                    "npu:pop_reusable_slots:launch",
+                    count=count,
+                    blocked_slot_ids=blocked_slot_ids,
+                    search_start=self._search_start,
+                )
+                result = self._native_ext.pop_reusable_slots(
                     self._slot_meta.contiguous(),
                     self._search_start.contiguous(),
                     blocked_slot_ids,
                     count,
                 )
+                _debug_sync(self.actual_blocks.device, stage="npu:pop_reusable_slots")
+                _debug_log("npu:pop_reusable_slots:done", selected_slot_ids=result, search_start=self._search_start)
+                return result
             return self._native_ext.pop_reusable_slots(
                 self._usage_count.contiguous(),
                 self._reusable_mask.contiguous(),
@@ -546,6 +667,16 @@ class KVCacheAdapter:
     ) -> None:
         if self._native_ext is not None:
             if self._platform == "npu":
+                _debug_log(
+                    "npu:commit_load_metadata:launch",
+                    evicted_logical_block_ids=evicted_logical_block_ids,
+                    miss_logical_block_ids=miss_logical_block_ids,
+                    miss_physical_slot_ids=miss_physical_slot_ids,
+                    hit_slot_ids=hit_slot_ids,
+                    hit_pin_counts=hit_pin_counts,
+                    hit_usage_counts=hit_usage_counts,
+                    miss_usage_counts=miss_usage_counts,
+                )
                 self._native_ext.commit_load_metadata(
                     self._logical_to_physical.contiguous(),
                     self._physical_to_logical.contiguous(),
@@ -558,6 +689,8 @@ class KVCacheAdapter:
                     hit_usage_counts.contiguous(),
                     miss_usage_counts.contiguous(),
                 )
+                _debug_sync(self.actual_blocks.device, stage="npu:commit_load_metadata")
+                _debug_log("npu:commit_load_metadata:done")
             else:
                 touched_slot_ids = torch.cat((hit_slot_ids, miss_physical_slot_ids), dim=0)
                 touched_usage_counts = torch.cat((hit_usage_counts, miss_usage_counts), dim=0)
@@ -604,6 +737,14 @@ class KVCacheAdapter:
     ) -> None:
         if self._native_ext is not None:
             if self._platform == "npu":
+                _debug_log(
+                    "npu:commit_save_metadata:launch",
+                    evicted_logical_block_ids=evicted_logical_block_ids,
+                    logical_block_ids=logical_block_ids,
+                    physical_slot_ids=physical_slot_ids,
+                    final_pin_counts=final_pin_counts,
+                    final_usage_counts=final_usage_counts,
+                )
                 self._native_ext.commit_save_metadata(
                     self._logical_to_physical.contiguous(),
                     self._physical_to_logical.contiguous(),
@@ -614,6 +755,8 @@ class KVCacheAdapter:
                     final_pin_counts.contiguous(),
                     final_usage_counts.contiguous(),
                 )
+                _debug_sync(self.actual_blocks.device, stage="npu:commit_save_metadata")
+                _debug_log("npu:commit_save_metadata:done")
             else:
                 empty_ids = self._logical_to_physical[:0]
                 empty_usage = self._usage_count[:0]
@@ -643,7 +786,10 @@ class KVCacheAdapter:
     def _copy_into_actual_blocks(self, physical_slot_ids: torch.Tensor, block_data: torch.Tensor) -> None:
         if physical_slot_ids.numel() == 0:
             return
+        _debug_log("copy_into_actual_blocks:launch", physical_slot_ids=physical_slot_ids, block_data=block_data)
         self.actual_blocks.index_copy_(0, physical_slot_ids, block_data)
+        _debug_sync(self.actual_blocks.device, stage="copy_into_actual_blocks")
+        _debug_log("copy_into_actual_blocks:done")
 
     def _ordered_reusable_slots(self) -> torch.Tensor:
         if self.num_actual_blocks == 0:

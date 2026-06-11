@@ -2,7 +2,14 @@
 
 #include "kernels/adapter_metadata_kernels.h"
 
+#include <acl/acl.h>
+
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <string>
 
 #include <c10/core/DeviceGuard.h>
 #include <torch/extension.h>
@@ -11,6 +18,54 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 namespace {
+
+bool debug_trace_enabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("KVCA_DEBUG_TRACE");
+    if (value == nullptr) {
+      return false;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+      return static_cast<char>(std::tolower(ch));
+    });
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+  }();
+  return enabled;
+}
+
+std::string summarize_tensor(const torch::Tensor &tensor) {
+  std::ostringstream oss;
+  oss << "shape=(";
+  for (int64_t index = 0; index < tensor.dim(); ++index) {
+    if (index > 0) {
+      oss << ",";
+    }
+    oss << tensor.size(index);
+  }
+  oss << "),dtype=" << tensor.scalar_type() << ",device=" << tensor.device();
+  return oss.str();
+}
+
+void debug_log(const char *stage, const std::string &message = "") {
+  if (!debug_trace_enabled()) {
+    return;
+  }
+  std::cerr << "[kvca-npu-debug] " << stage;
+  if (!message.empty()) {
+    std::cerr << " " << message;
+  }
+  std::cerr << std::endl;
+}
+
+void debug_sync_stream(aclrtStream stream, const char *stage) {
+  if (!debug_trace_enabled()) {
+    return;
+  }
+  const aclError status = aclrtSynchronizeStream(stream);
+  debug_log(stage, std::string("sync_status=") + std::to_string(static_cast<int>(status)));
+  TORCH_CHECK(status == ACL_SUCCESS, stage, " stream sync failed with status ", static_cast<int>(status));
+}
 
 torch::ScalarType slot_meta_scalar_type() {
 #if KVCA_SLOT_META_BITS == 8
@@ -70,6 +125,12 @@ std::vector<torch::Tensor> inspect_load_requests(
   const c10::OptionalDeviceGuard device_guard(logical_block_ids.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   const auto block_dim = block_dim_for(logical_block_ids.numel());
+  debug_log(
+      "inspect_load_requests:launch",
+      "logical_to_physical=" + summarize_tensor(logical_to_physical) +
+          " slot_meta=" + summarize_tensor(slot_meta) +
+          " logical_block_ids=" + summarize_tensor(logical_block_ids) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_inspect_load_requests");
   cmd.SetCustomHandler([&]() -> int {
@@ -87,6 +148,7 @@ std::vector<torch::Tensor> inspect_load_requests(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "inspect_load_requests:done");
   return {current_physical, resident_mask, updated_pin_counts, updated_usage_counts};
 }
 
@@ -107,6 +169,12 @@ std::vector<torch::Tensor> inspect_save_requests(
   const c10::OptionalDeviceGuard device_guard(logical_block_ids.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   const auto block_dim = block_dim_for(logical_block_ids.numel());
+  debug_log(
+      "inspect_save_requests:launch",
+      "logical_to_physical=" + summarize_tensor(logical_to_physical) +
+          " slot_meta=" + summarize_tensor(slot_meta) +
+          " logical_block_ids=" + summarize_tensor(logical_block_ids) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_inspect_save_requests");
   cmd.SetCustomHandler([&]() -> int {
@@ -123,6 +191,7 @@ std::vector<torch::Tensor> inspect_save_requests(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "inspect_save_requests:done");
   return {current_physical, existing_mask, final_usage_counts};
 }
 
@@ -152,6 +221,13 @@ torch::Tensor pop_reusable_slots(
   auto local_emit_workspace = torch::zeros({block_dim}, search_start.options());
   const c10::OptionalDeviceGuard device_guard(slot_meta.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  debug_log(
+      "pop_reusable_slots:launch",
+      "slot_meta=" + summarize_tensor(slot_meta) +
+          " search_start=" + summarize_tensor(search_start) +
+          " blocked_slot_ids=" + summarize_tensor(blocked_slot_ids) +
+          " count=" + std::to_string(count) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_pop_reusable_slots");
   cmd.SetCustomHandler([&]() -> int {
@@ -173,6 +249,7 @@ torch::Tensor pop_reusable_slots(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "pop_reusable_slots:done");
   return selected_slot_ids;
 }
 
@@ -202,6 +279,16 @@ void commit_load_metadata(
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   const auto block_dim = block_dim_for(
       std::max<int64_t>(std::max(evicted_logical_block_ids.numel(), miss_logical_block_ids.numel()), hit_slot_ids.numel()));
+  debug_log(
+      "commit_load_metadata:launch",
+      "evicted=" + summarize_tensor(evicted_logical_block_ids) +
+          " miss_logical=" + summarize_tensor(miss_logical_block_ids) +
+          " miss_physical=" + summarize_tensor(miss_physical_slot_ids) +
+          " hit_slot_ids=" + summarize_tensor(hit_slot_ids) +
+          " hit_pin_counts=" + summarize_tensor(hit_pin_counts) +
+          " hit_usage_counts=" + summarize_tensor(hit_usage_counts) +
+          " miss_usage_counts=" + summarize_tensor(miss_usage_counts) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_commit_load_metadata");
   cmd.SetCustomHandler([&]() -> int {
@@ -224,6 +311,7 @@ void commit_load_metadata(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "commit_load_metadata:done");
 }
 
 void commit_save_metadata(
@@ -247,6 +335,14 @@ void commit_save_metadata(
   const c10::OptionalDeviceGuard device_guard(logical_to_physical.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   const auto block_dim = block_dim_for(std::max<int64_t>(evicted_logical_block_ids.numel(), logical_block_ids.numel()));
+  debug_log(
+      "commit_save_metadata:launch",
+      "evicted=" + summarize_tensor(evicted_logical_block_ids) +
+          " logical_block_ids=" + summarize_tensor(logical_block_ids) +
+          " physical_slot_ids=" + summarize_tensor(physical_slot_ids) +
+          " final_pin_counts=" + summarize_tensor(final_pin_counts) +
+          " final_usage_counts=" + summarize_tensor(final_usage_counts) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_commit_save_metadata");
   cmd.SetCustomHandler([&]() -> int {
@@ -266,6 +362,7 @@ void commit_save_metadata(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "commit_save_metadata:done");
 }
 
 void release_metadata(
@@ -281,6 +378,12 @@ void release_metadata(
   const c10::OptionalDeviceGuard device_guard(logical_to_physical.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   const auto block_dim = block_dim_for(logical_block_ids.numel());
+  debug_log(
+      "release_metadata:launch",
+      "logical_to_physical=" + summarize_tensor(logical_to_physical) +
+          " slot_meta=" + summarize_tensor(slot_meta) +
+          " logical_block_ids=" + summarize_tensor(logical_block_ids) +
+          " block_dim=" + std::to_string(block_dim));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_release_metadata");
   cmd.SetCustomHandler([&]() -> int {
@@ -294,4 +397,5 @@ void release_metadata(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "release_metadata:done");
 }
