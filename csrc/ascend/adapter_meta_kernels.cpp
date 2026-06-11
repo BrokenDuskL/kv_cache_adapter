@@ -44,6 +44,33 @@ std::string summarize_tensor(const torch::Tensor &tensor) {
     oss << tensor.size(index);
   }
   oss << "),dtype=" << tensor.scalar_type() << ",device=" << tensor.device();
+  if (tensor.dim() == 1 && tensor.numel() <= 16) {
+    try {
+      const auto cpu_tensor = tensor.to(torch::kCPU);
+      oss << ",values=[";
+      for (int64_t index = 0; index < cpu_tensor.numel(); ++index) {
+        if (index > 0) {
+          oss << ",";
+        }
+        switch (cpu_tensor.scalar_type()) {
+          case torch::kInt64:
+            oss << cpu_tensor[index].item<int64_t>();
+            break;
+          case torch::kUInt8:
+            oss << static_cast<int32_t>(cpu_tensor[index].item<uint8_t>());
+            break;
+          case torch::kUInt16:
+            oss << static_cast<int32_t>(cpu_tensor[index].item<int64_t>());
+            break;
+          default:
+            oss << "?";
+            break;
+        }
+      }
+      oss << "]";
+    } catch (...) {
+    }
+  }
   return oss.str();
 }
 
@@ -250,6 +277,13 @@ torch::Tensor pop_reusable_slots(
   });
   cmd.Run();
   debug_sync_stream(stream, "pop_reusable_slots:done");
+  debug_log(
+      "pop_reusable_slots:state",
+      "selection_state=" + summarize_tensor(selection_state) +
+          " local_count_workspace=" + summarize_tensor(local_count_workspace) +
+          " local_offset_workspace=" + summarize_tensor(local_offset_workspace) +
+          " local_emit_workspace=" + summarize_tensor(local_emit_workspace) +
+          " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
   return selected_slot_ids;
 }
 
