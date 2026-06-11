@@ -91,7 +91,7 @@ void adapter_commit_save_metadata_kernel(
     int32_t num_evicted,
     const int64_t *logical_block_ids,
     const int64_t *physical_slot_ids,
-    const int64_t *final_pin_counts,
+    const kvca_slotmeta_t *final_pin_counts,
     const kvca_slotmeta_t *final_usage_counts,
     int32_t num_slots);
 

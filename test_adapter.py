@@ -542,6 +542,37 @@ def test_load_npu_extension_prefers_custom_wrapper(monkeypatch: pytest.MonkeyPat
     assert getattr(module, "_marker", None) == "local-wrapper"
 
 
+def test_npu_save_keeps_pin_counts_compact_dtype() -> None:
+    adapter = make_adapter()
+    captured: dict[str, torch.Tensor] = {}
+
+    class _FakeNativeExt:
+        def inspect_save_requests(self, *args):
+            del args
+            return (
+                torch.tensor([-1, -1], dtype=torch.int64),
+                torch.tensor([0, 0], dtype=torch.uint8),
+                torch.tensor([1, 1], dtype=torch.uint8),
+            )
+
+        def pop_reusable_slots(self, *args):
+            del args
+            return torch.tensor([0, 1], dtype=torch.int64)
+
+        def commit_save_metadata(self, *args) -> None:
+            captured["final_pin_counts"] = args[6]
+
+    adapter._native_ext = _FakeNativeExt()
+    adapter._platform = "npu"
+    adapter.save(
+        torch.tensor([0, 1], dtype=torch.int64),
+        make_payload([[10, 11], [20, 21]]),
+    )
+
+    assert captured["final_pin_counts"].dtype == torch.uint8
+    adapter.shutdown()
+
+
 def test_npu_custom_wrapper_prefers_standalone_ops(monkeypatch: pytest.MonkeyPatch) -> None:
     wrapper_path = pathlib.Path(adapter_module.__file__).with_name("kv_cache_adapter_npu_custom.py")
     imported_modules: list[str] = []

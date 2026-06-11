@@ -482,7 +482,8 @@ extern "C" __global__ __aicore__ void adapter_commit_save_metadata_entry(
         reinterpret_cast<__gm__ const int64_t *>(evicted_logical_block_ids_addr);
     __gm__ const int64_t *logical_block_ids = reinterpret_cast<__gm__ const int64_t *>(logical_block_ids_addr);
     __gm__ const int64_t *physical_slot_ids = reinterpret_cast<__gm__ const int64_t *>(physical_slot_ids_addr);
-    __gm__ const int64_t *final_pin_counts = reinterpret_cast<__gm__ const int64_t *>(final_pin_counts_addr);
+    __gm__ const kvca_slotmeta_t *final_pin_counts =
+        reinterpret_cast<__gm__ const kvca_slotmeta_t *>(final_pin_counts_addr);
     __gm__ const kvca_slotmeta_t *final_usage_counts =
         reinterpret_cast<__gm__ const kvca_slotmeta_t *>(final_usage_counts_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
@@ -681,7 +682,7 @@ void adapter_commit_save_metadata_kernel(
     int32_t num_evicted,
     const int64_t *logical_block_ids,
     const int64_t *physical_slot_ids,
-    const int64_t *final_pin_counts,
+    const kvca_slotmeta_t *final_pin_counts,
     const kvca_slotmeta_t *final_usage_counts,
     int32_t num_slots) {
     adapter_commit_save_metadata_entry<<<block_dim, nullptr, stream>>>(

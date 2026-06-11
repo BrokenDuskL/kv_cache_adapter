@@ -1552,8 +1552,8 @@ def _saturating_increment_usage(values: torch.Tensor) -> torch.Tensor:
     return torch.clamp(incremented, max=USAGE_COUNT_MAX).to(dtype=USAGE_DTYPE)
 
 
-def _slot_meta_pin_counts(slot_meta: torch.Tensor) -> torch.Tensor:
-    return (slot_meta.to(dtype=torch.int32) & _PIN_COUNT_MASK).to(dtype=PIN_COUNT_DTYPE)
+def _slot_meta_pin_counts(slot_meta: torch.Tensor, *, dtype: torch.dtype = PIN_COUNT_DTYPE) -> torch.Tensor:
+    return (slot_meta.to(dtype=torch.int32) & _PIN_COUNT_MASK).to(dtype=dtype)
 
 
 def _slot_meta_usage_counts(slot_meta: torch.Tensor) -> torch.Tensor:

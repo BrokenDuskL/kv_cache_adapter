@@ -363,7 +363,7 @@ void commit_save_metadata(
   check_tensor_1d(evicted_logical_block_ids, torch::kInt64, "evicted_logical_block_ids");
   check_tensor_1d(logical_block_ids, torch::kInt64, "logical_block_ids");
   check_tensor_1d(physical_slot_ids, torch::kInt64, "physical_slot_ids");
-  check_tensor_1d(final_pin_counts, torch::kInt64, "final_pin_counts");
+  check_tensor_1d(final_pin_counts, slot_meta_scalar_type(), "final_pin_counts");
   check_tensor_1d(final_usage_counts, slot_meta_scalar_type(), "final_usage_counts");
 
   const c10::OptionalDeviceGuard device_guard(logical_to_physical.device());
@@ -390,7 +390,7 @@ void commit_save_metadata(
         static_cast<int32_t>(evicted_logical_block_ids.numel()),
         logical_block_ids.data_ptr<int64_t>(),
         physical_slot_ids.data_ptr<int64_t>(),
-        final_pin_counts.data_ptr<int64_t>(),
+        final_pin_counts.data_ptr<kvca_slotmeta_t>(),
         final_usage_counts.data_ptr<kvca_slotmeta_t>(),
         static_cast<int32_t>(logical_block_ids.numel()));
     return 0;
