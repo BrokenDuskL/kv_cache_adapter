@@ -9,6 +9,7 @@ import sys
 
 
 _EXPORTS = (
+    "_build_info",
     "inspect_load_requests",
     "inspect_save_requests",
     "pop_reusable_slots",
@@ -60,6 +61,10 @@ _c_ops, _prefix = _load_ops_module()
 
 def _dispatch(name: str, *args):
     return getattr(_c_ops, f"{_prefix}{name}")(*args)
+
+
+def debug_build_info():
+    return _dispatch("_build_info")
 
 
 def inspect_load_requests(*args):

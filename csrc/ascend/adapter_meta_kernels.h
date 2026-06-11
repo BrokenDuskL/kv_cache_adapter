@@ -1,7 +1,10 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <string>
 #include <vector>
+
+std::string npu_custom_ops_build_info();
 
 std::vector<torch::Tensor> inspect_load_requests(
     torch::Tensor logical_to_physical,

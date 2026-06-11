@@ -55,27 +55,20 @@ std::string summarize_tensor(const torch::Tensor &tensor) {
   if (tensor.dim() == 1 && tensor.numel() <= 64) {
     try {
       const auto cpu_tensor = tensor.to(torch::kCPU);
-      oss << ",values=[";
-      for (int64_t index = 0; index < cpu_tensor.numel(); ++index) {
-        if (index > 0) {
-          oss << ",";
+      if (cpu_tensor.scalar_type() == torch::kInt64 || cpu_tensor.scalar_type() == torch::kUInt8 ||
+          cpu_tensor.scalar_type() == torch::kUInt16) {
+        const auto value_tensor = cpu_tensor.to(torch::kInt64);
+        oss << ",values=[";
+        for (int64_t index = 0; index < value_tensor.numel(); ++index) {
+          if (index > 0) {
+            oss << ",";
+          }
+          oss << value_tensor[index].item<int64_t>();
         }
-        switch (cpu_tensor.scalar_type()) {
-          case torch::kInt64:
-            oss << cpu_tensor[index].item<int64_t>();
-            break;
-          case torch::kUInt8:
-            oss << static_cast<int32_t>(cpu_tensor[index].item<uint8_t>());
-            break;
-          case torch::kUInt16:
-            oss << static_cast<int32_t>(cpu_tensor[index].item<int64_t>());
-            break;
-          default:
-            oss << "?";
-            break;
-        }
+        oss << "]";
+      } else {
+        oss << ",values=<unsupported dtype>";
       }
-      oss << "]";
     } catch (...) {
       oss << ",values=<unavailable>";
     }
@@ -107,6 +100,10 @@ void debug_sync_stream(aclrtStream stream, const char *stage) {
     return;
   }
   sync_stream_checked(stream, stage, true);
+}
+
+std::string npu_custom_ops_build_info() {
+  return std::string("kv_cache_adapter_npu_custom_ops built ") + __DATE__ + " " + __TIME__ + " from " + __FILE__;
 }
 
 torch::ScalarType slot_meta_scalar_type() {
@@ -275,6 +272,15 @@ std::vector<torch::Tensor> inspect_save_requests(
     return 0;
   });
   cmd.Run();
+  debug_sync_stream(stream, "inspect_save_requests:done");
+  debug_log(
+      "inspect_save_requests:state",
+      "logical_to_physical=" + summarize_tensor(logical_to_physical) +
+          " slot_meta=" + summarize_tensor(slot_meta) +
+          " logical_block_ids=" + summarize_tensor(logical_block_ids) +
+          " current_physical=" + summarize_tensor(current_physical) +
+          " existing_mask=" + summarize_tensor(existing_mask) +
+          " final_usage_counts=" + summarize_tensor(final_usage_counts));
   return {current_physical, existing_mask, final_usage_counts};
 }
 

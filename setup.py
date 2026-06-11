@@ -218,7 +218,11 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         built_extension = built_modules[0]
         shutil.copy2(built_extension, expected_ext_path)
         if self.inplace:
-            shutil.copy2(built_extension, ROOT_DIR / expected_ext_path.name)
+            inplace_extension = ROOT_DIR / expected_ext_path.name
+            if inplace_extension.exists():
+                inplace_extension.unlink()
+            shutil.copy2(built_extension, inplace_extension)
+            print(f"copied {built_extension} -> {inplace_extension}", flush=True)
 
         support_lib = install_root / "libkv_cache_adapter_npu_custom_kernels.so"
         if not support_lib.exists():
@@ -229,6 +233,12 @@ class KVCacheAdapterBuildExtension(_BaseBuildExtension):
         dst_path = output_dir / support_lib.name
         if os.path.abspath(support_lib) != os.path.abspath(dst_path):
             shutil.copy2(support_lib, dst_path)
+        if self.inplace:
+            inplace_support_lib = ROOT_DIR / support_lib.name
+            if inplace_support_lib.exists():
+                inplace_support_lib.unlink()
+            shutil.copy2(support_lib, inplace_support_lib)
+            print(f"copied {support_lib} -> {inplace_support_lib}", flush=True)
 
 
 ext_modules: list[Extension] = [
