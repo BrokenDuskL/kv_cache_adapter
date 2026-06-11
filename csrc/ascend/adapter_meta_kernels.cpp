@@ -5,6 +5,11 @@
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <iostream>
+#include <sstream>
+#include <string>
 
 #include <c10/core/DeviceGuard.h>
 #include <torch/extension.h>
@@ -13,6 +18,96 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 namespace {
+
+bool env_flag_enabled(const char *name) {
+  const char *value = std::getenv(name);
+  if (value == nullptr) {
+    return false;
+  }
+  std::string normalized(value);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+bool debug_trace_enabled() {
+  static const bool enabled = env_flag_enabled("KVCA_DEBUG_TRACE");
+  return enabled;
+}
+
+bool pop_sync_enabled() {
+  static const bool enabled = env_flag_enabled("KVCA_NPU_POP_SYNC");
+  return enabled;
+}
+
+std::string summarize_tensor(const torch::Tensor &tensor) {
+  std::ostringstream oss;
+  oss << "shape=(";
+  for (int64_t index = 0; index < tensor.dim(); ++index) {
+    if (index > 0) {
+      oss << ",";
+    }
+    oss << tensor.size(index);
+  }
+  oss << "),dtype=" << tensor.scalar_type() << ",device=" << tensor.device()
+      << ",ptr=" << tensor.data_ptr();
+  if (tensor.dim() == 1 && tensor.numel() <= 64) {
+    try {
+      const auto cpu_tensor = tensor.to(torch::kCPU);
+      oss << ",values=[";
+      for (int64_t index = 0; index < cpu_tensor.numel(); ++index) {
+        if (index > 0) {
+          oss << ",";
+        }
+        switch (cpu_tensor.scalar_type()) {
+          case torch::kInt64:
+            oss << cpu_tensor[index].item<int64_t>();
+            break;
+          case torch::kUInt8:
+            oss << static_cast<int32_t>(cpu_tensor[index].item<uint8_t>());
+            break;
+          case torch::kUInt16:
+            oss << static_cast<int32_t>(cpu_tensor[index].item<int64_t>());
+            break;
+          default:
+            oss << "?";
+            break;
+        }
+      }
+      oss << "]";
+    } catch (...) {
+      oss << ",values=<unavailable>";
+    }
+  }
+  return oss.str();
+}
+
+void debug_log(const char *stage, const std::string &message = "") {
+  if (!debug_trace_enabled()) {
+    return;
+  }
+  std::cerr << "[kvca-npu-debug] " << stage;
+  if (!message.empty()) {
+    std::cerr << " " << message;
+  }
+  std::cerr << std::endl;
+}
+
+void sync_stream_checked(aclrtStream stream, const char *stage, bool log_status) {
+  const aclError status = aclrtSynchronizeStream(stream);
+  if (log_status && debug_trace_enabled()) {
+    debug_log(stage, std::string("sync_status=") + std::to_string(static_cast<int>(status)));
+  }
+  TORCH_CHECK(status == ACL_SUCCESS, stage, " stream sync failed with status ", static_cast<int>(status));
+}
+
+void debug_sync_stream(aclrtStream stream, const char *stage) {
+  if (!debug_trace_enabled()) {
+    return;
+  }
+  sync_stream_checked(stream, stage, true);
+}
 
 torch::ScalarType slot_meta_scalar_type() {
 #if KVCA_SLOT_META_BITS == 8
@@ -50,6 +145,61 @@ uint32_t block_dim_for(int64_t count) {
   // block partitioning path; run them on a single block until the multi-block
   // partition logic is proven correct on hardware.
   return 1;
+}
+
+const char *pop_debug_fields() {
+  return "fields=[stage_id,threshold,num_actual_blocks,count,block_dim,search_start,"
+         "selected_count,selected_threshold,local_count0,local_offset0,local_emit0,"
+         "selected0,selected1,selected_last,invalid_selected_index,invalid_selected_value,"
+         "blocked_count,direct_available_count,first_available_slot,second_available_slot,"
+         "slot0_meta,slot0_pin,slot0_usage,slot0_blocked,slot1_meta,slot1_pin,slot1_usage,"
+         "slot1_blocked,count_workspace_sum,emit_workspace_sum,max_write_end,first_oob_write_core,"
+         "selected_sample0,selected_sample1,selected_sample2,selected_sample3]";
+}
+
+void debug_probe_pop_state(
+    aclrtStream stream,
+    const char *stage,
+    int32_t stage_id,
+    int32_t threshold,
+    uint32_t block_dim,
+    int64_t count,
+    const torch::Tensor &slot_meta,
+    const torch::Tensor &search_start,
+    const torch::Tensor &blocked_mask,
+    const torch::Tensor &selection_state,
+    const torch::Tensor &local_count_workspace,
+    const torch::Tensor &local_offset_workspace,
+    const torch::Tensor &local_emit_workspace,
+    const torch::Tensor &selected_slot_ids) {
+  if (!debug_trace_enabled()) {
+    return;
+  }
+  auto debug_workspace = torch::empty({40}, search_start.options());
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_pop_reusable_slots_debug_probe");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_debug_pop_state_kernel(
+        stream,
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
+        blocked_mask.data_ptr<uint8_t>(),
+        search_start.data_ptr<int64_t>(),
+        selection_state.data_ptr<int64_t>(),
+        local_count_workspace.data_ptr<int64_t>(),
+        local_offset_workspace.data_ptr<int64_t>(),
+        local_emit_workspace.data_ptr<int64_t>(),
+        selected_slot_ids.data_ptr<int64_t>(),
+        debug_workspace.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()),
+        static_cast<int32_t>(count),
+        threshold,
+        static_cast<int32_t>(block_dim),
+        stage_id);
+    return 0;
+  });
+  cmd.Run();
+  debug_sync_stream(stream, stage);
+  debug_log(stage, std::string(pop_debug_fields()) + " values=" + summarize_tensor(debug_workspace));
 }
 
 }  // namespace
@@ -154,9 +304,34 @@ torch::Tensor pop_reusable_slots(
   auto local_emit_workspace = torch::zeros({block_dim}, search_start.options());
   const c10::OptionalDeviceGuard device_guard(slot_meta.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-  at_npu::native::OpCommand cmd;
-  cmd.Name("kv_cache_adapter_pop_reusable_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  const bool trace = debug_trace_enabled();
+  debug_log(
+      "pop_reusable_slots:launch",
+      "slot_meta=" + summarize_tensor(slot_meta) +
+          " search_start=" + summarize_tensor(search_start) +
+          " blocked_slot_ids=" + summarize_tensor(blocked_slot_ids) +
+          " count=" + std::to_string(count) +
+          " block_dim=" + std::to_string(block_dim));
+
+  auto probe = [&](const char *stage, int32_t stage_id, int32_t threshold) {
+    debug_probe_pop_state(
+        stream,
+        stage,
+        stage_id,
+        threshold,
+        block_dim,
+        count,
+        slot_meta,
+        search_start,
+        blocked_mask,
+        selection_state,
+        local_count_workspace,
+        local_offset_workspace,
+        local_emit_workspace,
+        selected_slot_ids);
+  };
+
+  auto run_pop_reusable_slots = [&]() {
     kvcache_ops::adapter_mark_blocked_slots_kernel(
         block_dim,
         stream,
@@ -209,9 +384,172 @@ torch::Tensor pop_reusable_slots(
         selected_slot_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()),
         static_cast<int32_t>(count));
-    return 0;
-  });
-  cmd.Run();
+  };
+
+  if (trace) {
+    debug_sync_stream(stream, "pop_reusable_slots:after_workspace_init");
+    probe("pop_reusable_slots:workspace_init_state", 0, -1);
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_mark_blocked_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_mark_blocked_slots_kernel(
+            block_dim,
+            stream,
+            blocked_slot_ids.data_ptr<int64_t>(),
+            blocked_mask.data_ptr<uint8_t>(),
+            static_cast<int32_t>(blocked_slot_ids.numel()));
+        return 0;
+      });
+      cmd.Run();
+      probe("pop_reusable_slots:after_mark_blocked", 1, -1);
+    }
+    for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
+      const int32_t current_threshold = threshold;
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_count_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_count_threshold_slots_kernel(
+              block_dim,
+              stream,
+              slot_meta.data_ptr<kvca_slotmeta_t>(),
+              blocked_mask.data_ptr<uint8_t>(),
+              search_start.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              local_count_workspace.data_ptr<int64_t>(),
+              static_cast<int32_t>(slot_meta.numel()),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        probe("pop_reusable_slots:after_count_threshold", 2, current_threshold);
+      }
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_plan_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_plan_threshold_slots_kernel(
+              stream,
+              local_count_workspace.data_ptr<int64_t>(),
+              local_offset_workspace.data_ptr<int64_t>(),
+              local_emit_workspace.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              static_cast<int32_t>(block_dim),
+              static_cast<int32_t>(count),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        probe("pop_reusable_slots:after_plan_threshold", 3, current_threshold);
+      }
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_collect_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_collect_threshold_slots_kernel(
+              block_dim,
+              stream,
+              slot_meta.data_ptr<kvca_slotmeta_t>(),
+              blocked_mask.data_ptr<uint8_t>(),
+              search_start.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              local_offset_workspace.data_ptr<int64_t>(),
+              local_emit_workspace.data_ptr<int64_t>(),
+              selected_slot_ids.data_ptr<int64_t>(),
+              static_cast<int32_t>(slot_meta.numel()),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        probe("pop_reusable_slots:after_collect_threshold", 4, current_threshold);
+      }
+      if (selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
+        break;
+      }
+    }
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_age_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_age_usage_kernel(
+            block_dim,
+            stream,
+            slot_meta.data_ptr<kvca_slotmeta_t>(),
+            selection_state.data_ptr<int64_t>(),
+            static_cast<int32_t>(slot_meta.numel()));
+        return 0;
+      });
+      cmd.Run();
+      probe("pop_reusable_slots:after_age_usage", 5, -1);
+    }
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_finalize_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_finalize_selected_slots_kernel(
+            stream,
+            selection_state.data_ptr<int64_t>(),
+            search_start.data_ptr<int64_t>(),
+            selected_slot_ids.data_ptr<int64_t>(),
+            static_cast<int32_t>(slot_meta.numel()),
+            static_cast<int32_t>(count));
+        return 0;
+      });
+      cmd.Run();
+      probe("pop_reusable_slots:after_finalize", 6, -1);
+    }
+    const auto selection_state_cpu = selection_state.to(torch::kCPU);
+    const int64_t selected_count = selection_state_cpu[0].item<int64_t>();
+    const int64_t selected_threshold = selection_state_cpu[1].item<int64_t>();
+    const auto selected_slot_ids_cpu = selected_slot_ids.to(torch::kCPU);
+    int64_t invalid_index = -1;
+    int64_t invalid_value = 0;
+    for (int64_t index = 0; index < selected_slot_ids_cpu.numel(); ++index) {
+      const int64_t slot_id = selected_slot_ids_cpu[index].item<int64_t>();
+      if (slot_id < 0 || slot_id >= slot_meta.numel()) {
+        invalid_index = index;
+        invalid_value = slot_id;
+        break;
+      }
+    }
+    TORCH_CHECK(
+        selected_count == count && invalid_index < 0,
+        "pop_reusable_slots failed to select valid slots: selected_count=",
+        selected_count,
+        ", selected_threshold=",
+        selected_threshold,
+        ", count=",
+        count,
+        ", invalid_index=",
+        invalid_index,
+        ", invalid_value=",
+        invalid_value,
+        ", selected_slot_ids=",
+        summarize_tensor(selected_slot_ids),
+        ", slot_meta=",
+        summarize_tensor(slot_meta),
+        ", blocked_slot_ids=",
+        summarize_tensor(blocked_slot_ids));
+    debug_log(
+        "pop_reusable_slots:done",
+        "selection_state=" + summarize_tensor(selection_state) +
+            " local_count_workspace=" + summarize_tensor(local_count_workspace) +
+            " local_offset_workspace=" + summarize_tensor(local_offset_workspace) +
+            " local_emit_workspace=" + summarize_tensor(local_emit_workspace) +
+            " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
+  } else {
+    at_npu::native::OpCommand cmd;
+    cmd.Name("kv_cache_adapter_pop_reusable_slots");
+    cmd.SetCustomHandler([&]() -> int {
+      run_pop_reusable_slots();
+      return 0;
+    });
+    cmd.Run();
+    if (pop_sync_enabled()) {
+      sync_stream_checked(stream, "pop_reusable_slots:forced_done", false);
+    }
+  }
   return selected_slot_ids;
 }
 

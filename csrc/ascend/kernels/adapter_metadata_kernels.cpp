@@ -406,6 +406,151 @@ extern "C" __global__ __aicore__ void adapter_finalize_selected_slots_entry(
     }
 }
 
+extern "C" __global__ __aicore__ void adapter_debug_pop_state_entry(
+    GM_ADDR slot_meta_addr,
+    GM_ADDR blocked_mask_addr,
+    GM_ADDR search_start_addr,
+    GM_ADDR selection_state_addr,
+    GM_ADDR local_count_workspace_addr,
+    GM_ADDR local_offset_workspace_addr,
+    GM_ADDR local_emit_workspace_addr,
+    GM_ADDR selected_slot_ids_out_addr,
+    GM_ADDR debug_workspace_addr,
+    int32_t num_actual_blocks,
+    int32_t count,
+    int32_t threshold,
+    int32_t block_dim,
+    int32_t stage_id) {
+    if (AscendC::GetBlockIdx() != 0) {
+        return;
+    }
+
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const uint8_t *blocked_mask = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask_addr);
+    __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
+    __gm__ const int64_t *local_count_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_count_workspace_addr);
+    __gm__ const int64_t *local_offset_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_offset_workspace_addr);
+    __gm__ const int64_t *local_emit_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_emit_workspace_addr);
+    __gm__ const int64_t *selected_slot_ids_out =
+        reinterpret_cast<__gm__ const int64_t *>(selected_slot_ids_out_addr);
+    __gm__ int64_t *debug_workspace = reinterpret_cast<__gm__ int64_t *>(debug_workspace_addr);
+
+    for (int32_t index = 0; index < 40; ++index) {
+        debug_workspace[index] = -777;
+    }
+
+    int64_t blocked_count = 0;
+    int64_t direct_available_count = 0;
+    int64_t first_available_slot = -1;
+    int64_t second_available_slot = -1;
+    int64_t search = 0;
+    if (num_actual_blocks > 0) {
+        search = search_start[0];
+    }
+    for (int32_t rotated_pos = 0; rotated_pos < num_actual_blocks; ++rotated_pos) {
+        const int32_t slot_id = static_cast<int32_t>((search + rotated_pos) % num_actual_blocks);
+        const kvca_slotmeta_t meta = slot_meta[slot_id];
+        const bool blocked = blocked_mask[slot_id] != 0;
+        if (blocked) {
+            blocked_count += 1;
+        }
+        if (!blocked && unpack_pin_count(meta) == 0 && unpack_usage_count(meta) == threshold) {
+            if (first_available_slot < 0) {
+                first_available_slot = slot_id;
+            } else if (second_available_slot < 0) {
+                second_available_slot = slot_id;
+            }
+            direct_available_count += 1;
+        }
+    }
+
+    int64_t selected0 = -1;
+    int64_t selected1 = -1;
+    int64_t selected_last = -1;
+    int64_t invalid_selected_index = -1;
+    int64_t invalid_selected_value = -1;
+    for (int32_t index = 0; index < count; ++index) {
+        const int64_t slot_id = selected_slot_ids_out[index];
+        if (index == 0) {
+            selected0 = slot_id;
+        } else if (index == 1) {
+            selected1 = slot_id;
+        }
+        if (index == count - 1) {
+            selected_last = slot_id;
+        }
+        if (invalid_selected_index < 0 && (slot_id < -1 || slot_id >= num_actual_blocks)) {
+            invalid_selected_index = index;
+            invalid_selected_value = slot_id;
+        }
+    }
+
+    int64_t count_workspace_sum = 0;
+    int64_t emit_workspace_sum = 0;
+    int64_t max_write_end = -1;
+    int64_t first_oob_write_core = -1;
+    for (int32_t core_index = 0; core_index < block_dim; ++core_index) {
+        const int64_t local_count = local_count_workspace[core_index];
+        const int64_t local_offset = local_offset_workspace[core_index];
+        const int64_t local_emit = local_emit_workspace[core_index];
+        count_workspace_sum += local_count;
+        emit_workspace_sum += local_emit;
+        const int64_t write_end = local_offset + local_emit;
+        if (write_end > max_write_end) {
+            max_write_end = write_end;
+        }
+        if (first_oob_write_core < 0 && (local_offset < 0 || local_emit < 0 || write_end > count)) {
+            first_oob_write_core = core_index;
+        }
+    }
+
+    const kvca_slotmeta_t slot0_meta = num_actual_blocks > 0 ? slot_meta[0] : static_cast<kvca_slotmeta_t>(0);
+    const kvca_slotmeta_t slot1_meta = num_actual_blocks > 1 ? slot_meta[1] : static_cast<kvca_slotmeta_t>(0);
+    const int64_t slot0_blocked = num_actual_blocks > 0 ? static_cast<int64_t>(blocked_mask[0]) : -1;
+    const int64_t slot1_blocked = num_actual_blocks > 1 ? static_cast<int64_t>(blocked_mask[1]) : -1;
+
+    debug_workspace[0] = stage_id;
+    debug_workspace[1] = threshold;
+    debug_workspace[2] = num_actual_blocks;
+    debug_workspace[3] = count;
+    debug_workspace[4] = block_dim;
+    debug_workspace[5] = search;
+    debug_workspace[6] = selection_state[0];
+    debug_workspace[7] = selection_state[1];
+    debug_workspace[8] = block_dim > 0 ? local_count_workspace[0] : -1;
+    debug_workspace[9] = block_dim > 0 ? local_offset_workspace[0] : -1;
+    debug_workspace[10] = block_dim > 0 ? local_emit_workspace[0] : -1;
+    debug_workspace[11] = selected0;
+    debug_workspace[12] = selected1;
+    debug_workspace[13] = selected_last;
+    debug_workspace[14] = invalid_selected_index;
+    debug_workspace[15] = invalid_selected_value;
+    debug_workspace[16] = blocked_count;
+    debug_workspace[17] = direct_available_count;
+    debug_workspace[18] = first_available_slot;
+    debug_workspace[19] = second_available_slot;
+    debug_workspace[20] = static_cast<int64_t>(slot0_meta);
+    debug_workspace[21] = unpack_pin_count(slot0_meta);
+    debug_workspace[22] = unpack_usage_count(slot0_meta);
+    debug_workspace[23] = slot0_blocked;
+    debug_workspace[24] = static_cast<int64_t>(slot1_meta);
+    debug_workspace[25] = unpack_pin_count(slot1_meta);
+    debug_workspace[26] = unpack_usage_count(slot1_meta);
+    debug_workspace[27] = slot1_blocked;
+    debug_workspace[28] = count_workspace_sum;
+    debug_workspace[29] = emit_workspace_sum;
+    debug_workspace[30] = max_write_end;
+    debug_workspace[31] = first_oob_write_core;
+    debug_workspace[32] = count > 0 ? selected_slot_ids_out[0] : -1;
+    debug_workspace[33] = count > 1 ? selected_slot_ids_out[1] : -1;
+    debug_workspace[34] = count > 2 ? selected_slot_ids_out[2] : -1;
+    debug_workspace[35] = count > 3 ? selected_slot_ids_out[3] : -1;
+}
+
 extern "C" __global__ __aicore__ void adapter_commit_load_metadata_entry(
     GM_ADDR logical_to_physical_addr,
     GM_ADDR physical_to_logical_addr,
@@ -681,6 +826,39 @@ void adapter_finalize_selected_slots_kernel(
         launch_arg(selected_slot_ids_out),
         num_actual_blocks,
         count);
+}
+
+void adapter_debug_pop_state_kernel(
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    const int64_t *local_count_workspace,
+    const int64_t *local_offset_workspace,
+    const int64_t *local_emit_workspace,
+    const int64_t *selected_slot_ids_out,
+    int64_t *debug_workspace,
+    int32_t num_actual_blocks,
+    int32_t count,
+    int32_t threshold,
+    int32_t block_dim,
+    int32_t stage_id) {
+    adapter_debug_pop_state_entry<<<1, nullptr, stream>>>(
+        launch_arg(slot_meta),
+        launch_arg(blocked_mask),
+        launch_arg(search_start),
+        launch_arg(selection_state),
+        launch_arg(local_count_workspace),
+        launch_arg(local_offset_workspace),
+        launch_arg(local_emit_workspace),
+        launch_arg(selected_slot_ids_out),
+        launch_arg(debug_workspace),
+        num_actual_blocks,
+        count,
+        threshold,
+        block_dim,
+        stage_id);
 }
 
 void adapter_pop_reusable_slots_kernel(

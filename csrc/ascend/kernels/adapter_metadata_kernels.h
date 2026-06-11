@@ -120,6 +120,23 @@ void adapter_finalize_selected_slots_kernel(
     int32_t num_actual_blocks,
     int32_t count);
 
+void adapter_debug_pop_state_kernel(
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    const int64_t *local_count_workspace,
+    const int64_t *local_offset_workspace,
+    const int64_t *local_emit_workspace,
+    const int64_t *selected_slot_ids_out,
+    int64_t *debug_workspace,
+    int32_t num_actual_blocks,
+    int32_t count,
+    int32_t threshold,
+    int32_t block_dim,
+    int32_t stage_id);
+
 void adapter_commit_load_metadata_kernel(
     uint32_t block_dim,
     void *stream,
