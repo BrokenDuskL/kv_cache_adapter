@@ -4,8 +4,6 @@
 
 namespace {
 
-using namespace AscendC;
-
 constexpr int32_t kMetaTileElems = 256;
 
 __aicore__ inline int32_t chunk_begin(int32_t total, int32_t core_index, int32_t core_count) {
@@ -28,7 +26,6 @@ __aicore__ inline void load_tile(
     AscendC::GlobalTensor<T> global_tensor;
     global_tensor.SetGlobalBuffer(const_cast<__gm__ T *>(global_ptr), len);
     AscendC::DataCopy(local_tensor, global_tensor, len);
-    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename T>
@@ -38,9 +35,7 @@ __aicore__ inline void store_tile(
     int32_t len) {
     AscendC::GlobalTensor<T> global_tensor;
     global_tensor.SetGlobalBuffer(global_ptr, len);
-    PipeBarrier<PIPE_ALL>();
     AscendC::DataCopy(global_tensor, local_tensor, len);
-    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename T>
@@ -236,6 +231,155 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
         rotated_pos += contiguous_len;
     }
     local_count_workspace[core_index] = local_count;
+}
+
+extern "C" __global__ __aicore__ void adapter_debug_count_threshold_slots_entry(
+    GM_ADDR slot_meta_addr,
+    GM_ADDR blocked_mask_addr,
+    GM_ADDR search_start_addr,
+    GM_ADDR selection_state_addr,
+    GM_ADDR local_count_workspace_addr,
+    GM_ADDR debug_workspace_addr,
+    int32_t num_actual_blocks,
+    int32_t threshold,
+    int32_t block_dim) {
+    if (AscendC::GetBlockIdx() != 0) {
+        return;
+    }
+
+    __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
+    __gm__ const uint8_t *blocked_mask = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask_addr);
+    __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
+    __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
+    __gm__ const int64_t *local_count_workspace =
+        reinterpret_cast<__gm__ const int64_t *>(local_count_workspace_addr);
+    __gm__ int64_t *debug_workspace = reinterpret_cast<__gm__ int64_t *>(debug_workspace_addr);
+
+    for (int32_t index = 0; index < 24; ++index) {
+        debug_workspace[index] = -777;
+    }
+
+    const int32_t begin = chunk_begin(num_actual_blocks, 0, block_dim);
+    const int32_t end = chunk_end(num_actual_blocks, 0, block_dim);
+    const int64_t start = search_start[0];
+    __gm__ const uint8_t *blocked_mask_u8 = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask);
+
+    int64_t direct_count = 0;
+    int64_t direct_slot0 = -1;
+    int64_t direct_meta0 = -1;
+    int64_t direct_blocked0 = -1;
+    int64_t direct_slot1 = -1;
+    int64_t direct_meta1 = -1;
+    int64_t direct_blocked1 = -1;
+    int32_t direct_sample_count = 0;
+    int32_t rotated_pos = begin;
+    while (rotated_pos < end) {
+        const int32_t actual_begin = static_cast<int32_t>((start + rotated_pos) % num_actual_blocks);
+        const int32_t contiguous_len = ((end - rotated_pos) < (num_actual_blocks - actual_begin))
+            ? (end - rotated_pos)
+            : (num_actual_blocks - actual_begin);
+        for (int32_t inner_index = 0; inner_index < contiguous_len; ++inner_index) {
+            const int32_t slot_id = actual_begin + inner_index;
+            const kvca_slotmeta_t meta = slot_meta[slot_id];
+            const uint8_t blocked = blocked_mask_u8[slot_id];
+            if (direct_sample_count == 0) {
+                direct_slot0 = slot_id;
+                direct_meta0 = static_cast<int64_t>(meta);
+                direct_blocked0 = static_cast<int64_t>(blocked);
+            } else if (direct_sample_count == 1) {
+                direct_slot1 = slot_id;
+                direct_meta1 = static_cast<int64_t>(meta);
+                direct_blocked1 = static_cast<int64_t>(blocked);
+            }
+            direct_sample_count += 1;
+            if (blocked == 0 &&
+                unpack_pin_count(meta) == 0 &&
+                unpack_usage_count(meta) == threshold) {
+                direct_count += 1;
+            }
+        }
+        rotated_pos += contiguous_len;
+    }
+
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> calc_buf;
+    uint32_t buffer_size =
+        ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems) +
+        ceil_32_bytes(sizeof(uint8_t) * kMetaTileElems);
+    pipe.InitBuffer(calc_buf, buffer_size);
+    int32_t offset = 0;
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, offset);
+    offset += ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems);
+    auto blocked_local = calc_buf.GetWithOffset<uint8_t>(kMetaTileElems, offset);
+
+    int64_t tile_count = 0;
+    int64_t tile_slot0 = -1;
+    int64_t tile_meta0 = -1;
+    int64_t tile_blocked0 = -1;
+    int64_t tile_slot1 = -1;
+    int64_t tile_meta1 = -1;
+    int64_t tile_blocked1 = -1;
+    int32_t tile_sample_count = 0;
+    rotated_pos = begin;
+    while (rotated_pos < end) {
+        const int32_t actual_begin = static_cast<int32_t>((start + rotated_pos) % num_actual_blocks);
+        const int32_t contiguous_len = ((end - rotated_pos) < (num_actual_blocks - actual_begin))
+            ? (end - rotated_pos)
+            : (num_actual_blocks - actual_begin);
+        for (int32_t tile_offset = 0; tile_offset < contiguous_len; tile_offset += kMetaTileElems) {
+            const int32_t tile_len =
+                contiguous_len - tile_offset > kMetaTileElems ? kMetaTileElems : (contiguous_len - tile_offset);
+            const int32_t tile_begin = actual_begin + tile_offset;
+            load_tile(meta_local, slot_meta + tile_begin, tile_len);
+            load_tile(blocked_local, blocked_mask_u8 + tile_begin, tile_len);
+            for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
+                const int32_t slot_id = tile_begin + inner_index;
+                const kvca_slotmeta_t meta = meta_local(inner_index);
+                const uint8_t blocked = blocked_local(inner_index);
+                if (tile_sample_count == 0) {
+                    tile_slot0 = slot_id;
+                    tile_meta0 = static_cast<int64_t>(meta);
+                    tile_blocked0 = static_cast<int64_t>(blocked);
+                } else if (tile_sample_count == 1) {
+                    tile_slot1 = slot_id;
+                    tile_meta1 = static_cast<int64_t>(meta);
+                    tile_blocked1 = static_cast<int64_t>(blocked);
+                }
+                tile_sample_count += 1;
+                if (blocked == 0 &&
+                    unpack_pin_count(meta) == 0 &&
+                    unpack_usage_count(meta) == threshold) {
+                    tile_count += 1;
+                }
+            }
+        }
+        rotated_pos += contiguous_len;
+    }
+
+    debug_workspace[0] = threshold;
+    debug_workspace[1] = num_actual_blocks;
+    debug_workspace[2] = block_dim;
+    debug_workspace[3] = begin;
+    debug_workspace[4] = end;
+    debug_workspace[5] = start;
+    debug_workspace[6] = selection_state[0];
+    debug_workspace[7] = selection_state[1];
+    debug_workspace[8] = local_count_workspace[0];
+    debug_workspace[9] = direct_count;
+    debug_workspace[10] = tile_count;
+    debug_workspace[11] = direct_slot0;
+    debug_workspace[12] = direct_meta0;
+    debug_workspace[13] = direct_blocked0;
+    debug_workspace[14] = tile_slot0;
+    debug_workspace[15] = tile_meta0;
+    debug_workspace[16] = tile_blocked0;
+    debug_workspace[17] = direct_slot1;
+    debug_workspace[18] = direct_meta1;
+    debug_workspace[19] = direct_blocked1;
+    debug_workspace[20] = tile_slot1;
+    debug_workspace[21] = tile_meta1;
+    debug_workspace[22] = tile_blocked1;
+    debug_workspace[23] = direct_sample_count;
 }
 
 extern "C" __global__ __aicore__ void adapter_plan_threshold_slots_entry(
@@ -611,6 +755,29 @@ void adapter_count_threshold_slots_kernel(
         launch_arg(search_start),
         launch_arg(selection_state),
         launch_arg(local_count_workspace),
+        num_actual_blocks,
+        threshold,
+        static_cast<int32_t>(block_dim));
+}
+
+void adapter_debug_count_threshold_slots_kernel(
+    uint32_t block_dim,
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    const int64_t *local_count_workspace,
+    int64_t *debug_workspace,
+    int32_t num_actual_blocks,
+    int32_t threshold) {
+    adapter_debug_count_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
+        launch_arg(slot_meta),
+        launch_arg(blocked_mask),
+        launch_arg(search_start),
+        launch_arg(selection_state),
+        launch_arg(local_count_workspace),
+        launch_arg(debug_workspace),
         num_actual_blocks,
         threshold,
         static_cast<int32_t>(block_dim));

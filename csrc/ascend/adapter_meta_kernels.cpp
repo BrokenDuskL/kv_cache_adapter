@@ -44,7 +44,7 @@ std::string summarize_tensor(const torch::Tensor &tensor) {
     oss << tensor.size(index);
   }
   oss << "),dtype=" << tensor.scalar_type() << ",device=" << tensor.device();
-  if (tensor.dim() == 1 && tensor.numel() <= 16) {
+  if (tensor.dim() == 1 && tensor.numel() <= 32) {
     try {
       const auto cpu_tensor = tensor.to(torch::kCPU);
       oss << ",values=[";
@@ -256,17 +256,13 @@ torch::Tensor pop_reusable_slots(
           " blocked_slot_ids=" + summarize_tensor(blocked_slot_ids) +
           " count=" + std::to_string(count) +
           " block_dim=" + std::to_string(block_dim));
-  auto run_pop_reusable_slots = [&](bool emit_trace) {
+  auto run_pop_reusable_slots = [&]() {
     kvcache_ops::adapter_mark_blocked_slots_kernel(
         block_dim,
         stream,
         blocked_slot_ids.data_ptr<int64_t>(),
         blocked_mask.data_ptr<uint8_t>(),
         static_cast<int32_t>(blocked_slot_ids.numel()));
-    if (emit_trace) {
-      debug_sync_stream(stream, "pop_reusable_slots:after_mark_blocked");
-      debug_log("pop_reusable_slots:after_mark_blocked", "blocked_mask=" + summarize_tensor(blocked_mask));
-    }
     for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
       kvcache_ops::adapter_count_threshold_slots_kernel(
           block_dim,
@@ -278,14 +274,6 @@ torch::Tensor pop_reusable_slots(
           local_count_workspace.data_ptr<int64_t>(),
           static_cast<int32_t>(slot_meta.numel()),
           threshold);
-      if (emit_trace) {
-        debug_sync_stream(stream, "pop_reusable_slots:after_count_threshold");
-        debug_log(
-            "pop_reusable_slots:after_count_threshold",
-            "threshold=" + std::to_string(threshold) +
-                " selection_state=" + summarize_tensor(selection_state) +
-                " local_count_workspace=" + summarize_tensor(local_count_workspace));
-      }
       kvcache_ops::adapter_plan_threshold_slots_kernel(
           stream,
           local_count_workspace.data_ptr<int64_t>(),
@@ -295,15 +283,6 @@ torch::Tensor pop_reusable_slots(
           static_cast<int32_t>(block_dim),
           static_cast<int32_t>(count),
           threshold);
-      if (emit_trace) {
-        debug_sync_stream(stream, "pop_reusable_slots:after_plan_threshold");
-        debug_log(
-            "pop_reusable_slots:after_plan_threshold",
-            "threshold=" + std::to_string(threshold) +
-                " selection_state=" + summarize_tensor(selection_state) +
-                " local_offset_workspace=" + summarize_tensor(local_offset_workspace) +
-                " local_emit_workspace=" + summarize_tensor(local_emit_workspace));
-      }
       kvcache_ops::adapter_collect_threshold_slots_kernel(
           block_dim,
           stream,
@@ -316,17 +295,6 @@ torch::Tensor pop_reusable_slots(
           selected_slot_ids.data_ptr<int64_t>(),
           static_cast<int32_t>(slot_meta.numel()),
           threshold);
-      if (emit_trace) {
-        debug_sync_stream(stream, "pop_reusable_slots:after_collect_threshold");
-        debug_log(
-            "pop_reusable_slots:after_collect_threshold",
-            "threshold=" + std::to_string(threshold) +
-                " selection_state=" + summarize_tensor(selection_state) +
-                " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
-      }
-      if (emit_trace && selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
-        break;
-      }
     }
     kvcache_ops::adapter_age_usage_kernel(
         block_dim,
@@ -334,13 +302,6 @@ torch::Tensor pop_reusable_slots(
         slot_meta.data_ptr<kvca_slotmeta_t>(),
         selection_state.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()));
-    if (emit_trace) {
-      debug_sync_stream(stream, "pop_reusable_slots:after_age_usage");
-      debug_log(
-          "pop_reusable_slots:after_age_usage",
-          "selection_state=" + summarize_tensor(selection_state) +
-              " slot_meta=" + summarize_tensor(slot_meta));
-    }
     kvcache_ops::adapter_finalize_selected_slots_kernel(
         stream,
         selection_state.data_ptr<int64_t>(),
@@ -348,7 +309,164 @@ torch::Tensor pop_reusable_slots(
         selected_slot_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()),
         static_cast<int32_t>(count));
-    if (emit_trace) {
+  };
+  if (trace) {
+    auto debug_count_workspace = torch::empty({24}, search_start.options());
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_mark_blocked_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_mark_blocked_slots_kernel(
+            block_dim,
+            stream,
+            blocked_slot_ids.data_ptr<int64_t>(),
+            blocked_mask.data_ptr<uint8_t>(),
+            static_cast<int32_t>(blocked_slot_ids.numel()));
+        return 0;
+      });
+      cmd.Run();
+      debug_sync_stream(stream, "pop_reusable_slots:after_mark_blocked");
+      debug_log("pop_reusable_slots:after_mark_blocked", "blocked_mask=" + summarize_tensor(blocked_mask));
+    }
+    for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
+      const int32_t current_threshold = threshold;
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_count_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_count_threshold_slots_kernel(
+              block_dim,
+              stream,
+              slot_meta.data_ptr<kvca_slotmeta_t>(),
+              blocked_mask.data_ptr<uint8_t>(),
+              search_start.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              local_count_workspace.data_ptr<int64_t>(),
+              static_cast<int32_t>(slot_meta.numel()),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        debug_sync_stream(stream, "pop_reusable_slots:after_count_threshold");
+        debug_log(
+            "pop_reusable_slots:after_count_threshold",
+            "threshold=" + std::to_string(current_threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " local_count_workspace=" + summarize_tensor(local_count_workspace));
+      }
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_count_probe_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_debug_count_threshold_slots_kernel(
+              block_dim,
+              stream,
+              slot_meta.data_ptr<kvca_slotmeta_t>(),
+              blocked_mask.data_ptr<uint8_t>(),
+              search_start.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              local_count_workspace.data_ptr<int64_t>(),
+              debug_count_workspace.data_ptr<int64_t>(),
+              static_cast<int32_t>(slot_meta.numel()),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        debug_sync_stream(stream, "pop_reusable_slots:after_count_probe");
+        debug_log(
+            "pop_reusable_slots:after_count_probe",
+            "fields=[threshold,num_actual_blocks,block_dim,begin,end,start,selected_count,selected_threshold,"
+            "local_count,direct_count,tile_count,direct_slot0,direct_meta0,direct_blocked0,tile_slot0,"
+            "tile_meta0,tile_blocked0,direct_slot1,direct_meta1,direct_blocked1,tile_slot1,tile_meta1,"
+            "tile_blocked1,direct_samples] values=" + summarize_tensor(debug_count_workspace));
+      }
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_plan_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_plan_threshold_slots_kernel(
+              stream,
+              local_count_workspace.data_ptr<int64_t>(),
+              local_offset_workspace.data_ptr<int64_t>(),
+              local_emit_workspace.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              static_cast<int32_t>(block_dim),
+              static_cast<int32_t>(count),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        debug_sync_stream(stream, "pop_reusable_slots:after_plan_threshold");
+        debug_log(
+            "pop_reusable_slots:after_plan_threshold",
+            "threshold=" + std::to_string(current_threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " local_offset_workspace=" + summarize_tensor(local_offset_workspace) +
+                " local_emit_workspace=" + summarize_tensor(local_emit_workspace));
+      }
+      {
+        at_npu::native::OpCommand cmd;
+        cmd.Name("kv_cache_adapter_pop_reusable_slots_collect_debug");
+        cmd.SetCustomHandler([&, current_threshold]() -> int {
+          kvcache_ops::adapter_collect_threshold_slots_kernel(
+              block_dim,
+              stream,
+              slot_meta.data_ptr<kvca_slotmeta_t>(),
+              blocked_mask.data_ptr<uint8_t>(),
+              search_start.data_ptr<int64_t>(),
+              selection_state.data_ptr<int64_t>(),
+              local_offset_workspace.data_ptr<int64_t>(),
+              local_emit_workspace.data_ptr<int64_t>(),
+              selected_slot_ids.data_ptr<int64_t>(),
+              static_cast<int32_t>(slot_meta.numel()),
+              current_threshold);
+          return 0;
+        });
+        cmd.Run();
+        debug_sync_stream(stream, "pop_reusable_slots:after_collect_threshold");
+        debug_log(
+            "pop_reusable_slots:after_collect_threshold",
+            "threshold=" + std::to_string(current_threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
+      }
+      if (selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
+        break;
+      }
+    }
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_age_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_age_usage_kernel(
+            block_dim,
+            stream,
+            slot_meta.data_ptr<kvca_slotmeta_t>(),
+            selection_state.data_ptr<int64_t>(),
+            static_cast<int32_t>(slot_meta.numel()));
+        return 0;
+      });
+      cmd.Run();
+      debug_sync_stream(stream, "pop_reusable_slots:after_age_usage");
+      debug_log(
+          "pop_reusable_slots:after_age_usage",
+          "selection_state=" + summarize_tensor(selection_state) +
+              " slot_meta=" + summarize_tensor(slot_meta));
+    }
+    {
+      at_npu::native::OpCommand cmd;
+      cmd.Name("kv_cache_adapter_pop_reusable_slots_finalize_debug");
+      cmd.SetCustomHandler([&]() -> int {
+        kvcache_ops::adapter_finalize_selected_slots_kernel(
+            stream,
+            selection_state.data_ptr<int64_t>(),
+            search_start.data_ptr<int64_t>(),
+            selected_slot_ids.data_ptr<int64_t>(),
+            static_cast<int32_t>(slot_meta.numel()),
+            static_cast<int32_t>(count));
+        return 0;
+      });
+      cmd.Run();
       debug_sync_stream(stream, "pop_reusable_slots:after_finalize");
       debug_log(
           "pop_reusable_slots:after_finalize",
@@ -356,14 +474,11 @@ torch::Tensor pop_reusable_slots(
               " search_start=" + summarize_tensor(search_start) +
               " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
     }
-  };
-  if (trace) {
-    run_pop_reusable_slots(true);
   } else {
     at_npu::native::OpCommand cmd;
     cmd.Name("kv_cache_adapter_pop_reusable_slots");
     cmd.SetCustomHandler([&]() -> int {
-      run_pop_reusable_slots(false);
+      run_pop_reusable_slots();
       return 0;
     });
     cmd.Run();

@@ -82,6 +82,18 @@ void adapter_count_threshold_slots_kernel(
     int32_t num_actual_blocks,
     int32_t threshold);
 
+void adapter_debug_count_threshold_slots_kernel(
+    uint32_t block_dim,
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    const int64_t *local_count_workspace,
+    int64_t *debug_workspace,
+    int32_t num_actual_blocks,
+    int32_t threshold);
+
 void adapter_plan_threshold_slots_kernel(
     void *stream,
     const int64_t *local_count_workspace,
