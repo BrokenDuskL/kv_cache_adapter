@@ -241,7 +241,7 @@ torch::Tensor pop_reusable_slots(
   }
 
   const auto block_dim = block_dim_for(slot_meta.numel());
-  auto blocked_mask = torch::zeros({slot_meta.numel()}, slot_meta.options().dtype(torch::kBool));
+  auto blocked_mask = torch::zeros({slot_meta.numel()}, slot_meta.options().dtype(torch::kUInt8));
   auto selection_state = torch::tensor({0, -1}, search_start.options());
   auto local_count_workspace = torch::zeros({block_dim}, search_start.options());
   auto local_offset_workspace = torch::zeros({block_dim}, search_start.options());
@@ -258,21 +258,105 @@ torch::Tensor pop_reusable_slots(
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_pop_reusable_slots");
   cmd.SetCustomHandler([&]() -> int {
-    kvcache_ops::adapter_pop_reusable_slots_kernel(
+    kvcache_ops::adapter_mark_blocked_slots_kernel(
+        block_dim,
+        stream,
+        blocked_slot_ids.data_ptr<int64_t>(),
+        blocked_mask.data_ptr<uint8_t>(),
+        static_cast<int32_t>(blocked_slot_ids.numel()));
+    if (debug_trace_enabled()) {
+      debug_sync_stream(stream, "pop_reusable_slots:after_mark_blocked");
+      debug_log("pop_reusable_slots:after_mark_blocked", "blocked_mask=" + summarize_tensor(blocked_mask));
+    }
+    for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
+      kvcache_ops::adapter_count_threshold_slots_kernel(
+          block_dim,
+          stream,
+          slot_meta.data_ptr<kvca_slotmeta_t>(),
+          blocked_mask.data_ptr<uint8_t>(),
+          search_start.data_ptr<int64_t>(),
+          selection_state.data_ptr<int64_t>(),
+          local_count_workspace.data_ptr<int64_t>(),
+          static_cast<int32_t>(slot_meta.numel()),
+          threshold);
+      if (debug_trace_enabled()) {
+        debug_sync_stream(stream, "pop_reusable_slots:after_count_threshold");
+        debug_log(
+            "pop_reusable_slots:after_count_threshold",
+            "threshold=" + std::to_string(threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " local_count_workspace=" + summarize_tensor(local_count_workspace));
+      }
+      kvcache_ops::adapter_plan_threshold_slots_kernel(
+          stream,
+          local_count_workspace.data_ptr<int64_t>(),
+          local_offset_workspace.data_ptr<int64_t>(),
+          local_emit_workspace.data_ptr<int64_t>(),
+          selection_state.data_ptr<int64_t>(),
+          static_cast<int32_t>(block_dim),
+          static_cast<int32_t>(count),
+          threshold);
+      if (debug_trace_enabled()) {
+        debug_sync_stream(stream, "pop_reusable_slots:after_plan_threshold");
+        debug_log(
+            "pop_reusable_slots:after_plan_threshold",
+            "threshold=" + std::to_string(threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " local_offset_workspace=" + summarize_tensor(local_offset_workspace) +
+                " local_emit_workspace=" + summarize_tensor(local_emit_workspace));
+      }
+      kvcache_ops::adapter_collect_threshold_slots_kernel(
+          block_dim,
+          stream,
+          slot_meta.data_ptr<kvca_slotmeta_t>(),
+          blocked_mask.data_ptr<uint8_t>(),
+          search_start.data_ptr<int64_t>(),
+          selection_state.data_ptr<int64_t>(),
+          local_offset_workspace.data_ptr<int64_t>(),
+          local_emit_workspace.data_ptr<int64_t>(),
+          selected_slot_ids.data_ptr<int64_t>(),
+          static_cast<int32_t>(slot_meta.numel()),
+          threshold);
+      if (debug_trace_enabled()) {
+        debug_sync_stream(stream, "pop_reusable_slots:after_collect_threshold");
+        debug_log(
+            "pop_reusable_slots:after_collect_threshold",
+            "threshold=" + std::to_string(threshold) +
+                " selection_state=" + summarize_tensor(selection_state) +
+                " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
+      }
+      if (debug_trace_enabled() && selection_state.to(torch::kCPU)[1].item<int64_t>() >= 0) {
+        break;
+      }
+    }
+    kvcache_ops::adapter_age_usage_kernel(
         block_dim,
         stream,
         slot_meta.data_ptr<kvca_slotmeta_t>(),
-        search_start.data_ptr<int64_t>(),
-        blocked_slot_ids.data_ptr<int64_t>(),
-        blocked_mask.data_ptr<bool>(),
         selection_state.data_ptr<int64_t>(),
-        local_count_workspace.data_ptr<int64_t>(),
-        local_offset_workspace.data_ptr<int64_t>(),
-        local_emit_workspace.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()));
+    if (debug_trace_enabled()) {
+      debug_sync_stream(stream, "pop_reusable_slots:after_age_usage");
+      debug_log(
+          "pop_reusable_slots:after_age_usage",
+          "selection_state=" + summarize_tensor(selection_state) +
+              " slot_meta=" + summarize_tensor(slot_meta));
+    }
+    kvcache_ops::adapter_finalize_selected_slots_kernel(
+        stream,
+        selection_state.data_ptr<int64_t>(),
+        search_start.data_ptr<int64_t>(),
         selected_slot_ids.data_ptr<int64_t>(),
         static_cast<int32_t>(slot_meta.numel()),
-        static_cast<int32_t>(blocked_slot_ids.numel()),
         static_cast<int32_t>(count));
+    if (debug_trace_enabled()) {
+      debug_sync_stream(stream, "pop_reusable_slots:after_finalize");
+      debug_log(
+          "pop_reusable_slots:after_finalize",
+          "selection_state=" + summarize_tensor(selection_state) +
+              " search_start=" + summarize_tensor(search_start) +
+              " selected_slot_ids=" + summarize_tensor(selected_slot_ids));
+    }
     return 0;
   });
   cmd.Run();

@@ -147,7 +147,7 @@ extern "C" __global__ __aicore__ void adapter_mark_blocked_slots_entry(
     int32_t num_blocked_slot_ids,
     int32_t block_dim) {
     __gm__ const int64_t *blocked_slot_ids = reinterpret_cast<__gm__ const int64_t *>(blocked_slot_ids_addr);
-    __gm__ bool *blocked_mask = reinterpret_cast<__gm__ bool *>(blocked_mask_addr);
+    __gm__ uint8_t *blocked_mask = reinterpret_cast<__gm__ uint8_t *>(blocked_mask_addr);
     const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
     const int32_t begin = chunk_begin(num_blocked_slot_ids, core_index, block_dim);
     const int32_t end = chunk_end(num_blocked_slot_ids, core_index, block_dim);
@@ -180,7 +180,7 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
     int32_t threshold,
     int32_t block_dim) {
     __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
-    __gm__ const bool *blocked_mask = reinterpret_cast<__gm__ const bool *>(blocked_mask_addr);
+    __gm__ const uint8_t *blocked_mask = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask_addr);
     __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
     __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
     __gm__ int64_t *local_count_workspace = reinterpret_cast<__gm__ int64_t *>(local_count_workspace_addr);
@@ -284,7 +284,7 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
     int32_t threshold,
     int32_t block_dim) {
     __gm__ const kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ const kvca_slotmeta_t *>(slot_meta_addr);
-    __gm__ const bool *blocked_mask = reinterpret_cast<__gm__ const bool *>(blocked_mask_addr);
+    __gm__ const uint8_t *blocked_mask = reinterpret_cast<__gm__ const uint8_t *>(blocked_mask_addr);
     __gm__ const int64_t *search_start = reinterpret_cast<__gm__ const int64_t *>(search_start_addr);
     __gm__ const int64_t *selection_state = reinterpret_cast<__gm__ const int64_t *>(selection_state_addr);
     __gm__ const int64_t *local_offset_workspace =
@@ -574,13 +574,122 @@ void adapter_inspect_save_requests_kernel(
         static_cast<int32_t>(block_dim));
 }
 
+void adapter_mark_blocked_slots_kernel(
+    uint32_t block_dim,
+    void *stream,
+    const int64_t *blocked_slot_ids,
+    uint8_t *blocked_mask,
+    int32_t num_blocked_slot_ids) {
+    if (num_blocked_slot_ids <= 0) {
+        return;
+    }
+    adapter_mark_blocked_slots_entry<<<block_dim, nullptr, stream>>>(
+        launch_arg(blocked_slot_ids),
+        launch_arg(blocked_mask),
+        num_blocked_slot_ids,
+        static_cast<int32_t>(block_dim));
+}
+
+void adapter_count_threshold_slots_kernel(
+    uint32_t block_dim,
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    int64_t *local_count_workspace,
+    int32_t num_actual_blocks,
+    int32_t threshold) {
+    adapter_count_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
+        launch_arg(slot_meta),
+        launch_arg(blocked_mask),
+        launch_arg(search_start),
+        launch_arg(selection_state),
+        launch_arg(local_count_workspace),
+        num_actual_blocks,
+        threshold,
+        static_cast<int32_t>(block_dim));
+}
+
+void adapter_plan_threshold_slots_kernel(
+    void *stream,
+    const int64_t *local_count_workspace,
+    int64_t *local_offset_workspace,
+    int64_t *local_emit_workspace,
+    int64_t *selection_state,
+    int32_t block_dim,
+    int32_t count,
+    int32_t threshold) {
+    adapter_plan_threshold_slots_entry<<<1, nullptr, stream>>>(
+        launch_arg(local_count_workspace),
+        launch_arg(local_offset_workspace),
+        launch_arg(local_emit_workspace),
+        launch_arg(selection_state),
+        block_dim,
+        count,
+        threshold);
+}
+
+void adapter_collect_threshold_slots_kernel(
+    uint32_t block_dim,
+    void *stream,
+    const kvca_slotmeta_t *slot_meta,
+    const uint8_t *blocked_mask,
+    const int64_t *search_start,
+    const int64_t *selection_state,
+    const int64_t *local_offset_workspace,
+    const int64_t *local_emit_workspace,
+    int64_t *selected_slot_ids_out,
+    int32_t num_actual_blocks,
+    int32_t threshold) {
+    adapter_collect_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
+        launch_arg(slot_meta),
+        launch_arg(blocked_mask),
+        launch_arg(search_start),
+        launch_arg(selection_state),
+        launch_arg(local_offset_workspace),
+        launch_arg(local_emit_workspace),
+        launch_arg(selected_slot_ids_out),
+        num_actual_blocks,
+        threshold,
+        static_cast<int32_t>(block_dim));
+}
+
+void adapter_age_usage_kernel(
+    uint32_t block_dim,
+    void *stream,
+    kvca_slotmeta_t *slot_meta,
+    const int64_t *selection_state,
+    int32_t num_actual_blocks) {
+    adapter_age_usage_entry<<<block_dim, nullptr, stream>>>(
+        launch_arg(slot_meta),
+        launch_arg(selection_state),
+        num_actual_blocks,
+        static_cast<int32_t>(block_dim));
+}
+
+void adapter_finalize_selected_slots_kernel(
+    void *stream,
+    const int64_t *selection_state,
+    int64_t *search_start,
+    int64_t *selected_slot_ids_out,
+    int32_t num_actual_blocks,
+    int32_t count) {
+    adapter_finalize_selected_slots_entry<<<1, nullptr, stream>>>(
+        launch_arg(selection_state),
+        launch_arg(search_start),
+        launch_arg(selected_slot_ids_out),
+        num_actual_blocks,
+        count);
+}
+
 void adapter_pop_reusable_slots_kernel(
     uint32_t block_dim,
     void *stream,
     kvca_slotmeta_t *slot_meta,
     int64_t *search_start,
     const int64_t *blocked_slot_ids,
-    bool *blocked_mask,
+    uint8_t *blocked_mask,
     int64_t *selection_state,
     int64_t *local_count_workspace,
     int64_t *local_offset_workspace,
@@ -589,54 +698,47 @@ void adapter_pop_reusable_slots_kernel(
     int32_t num_actual_blocks,
     int32_t num_blocked_slot_ids,
     int32_t count) {
-    if (num_blocked_slot_ids > 0) {
-        adapter_mark_blocked_slots_entry<<<block_dim, nullptr, stream>>>(
-            launch_arg(blocked_slot_ids),
-            launch_arg(blocked_mask),
-            num_blocked_slot_ids,
-            static_cast<int32_t>(block_dim));
-    }
+    adapter_mark_blocked_slots_kernel(
+        block_dim,
+        stream,
+        blocked_slot_ids,
+        blocked_mask,
+        num_blocked_slot_ids);
     for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
-        adapter_count_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
-            launch_arg(slot_meta),
-            launch_arg(blocked_mask),
-            launch_arg(search_start),
-            launch_arg(selection_state),
-            launch_arg(local_count_workspace),
+        adapter_count_threshold_slots_kernel(
+            block_dim,
+            stream,
+            slot_meta,
+            blocked_mask,
+            search_start,
+            selection_state,
+            local_count_workspace,
             num_actual_blocks,
-            threshold,
-            static_cast<int32_t>(block_dim));
-        adapter_plan_threshold_slots_entry<<<1, nullptr, stream>>>(
-            launch_arg(local_count_workspace),
-            launch_arg(local_offset_workspace),
-            launch_arg(local_emit_workspace),
-            launch_arg(selection_state),
+            threshold);
+        adapter_plan_threshold_slots_kernel(
+            stream,
+            local_count_workspace,
+            local_offset_workspace,
+            local_emit_workspace,
+            selection_state,
             static_cast<int32_t>(block_dim),
             count,
             threshold);
-        adapter_collect_threshold_slots_entry<<<block_dim, nullptr, stream>>>(
-            launch_arg(slot_meta),
-            launch_arg(blocked_mask),
-            launch_arg(search_start),
-            launch_arg(selection_state),
-            launch_arg(local_offset_workspace),
-            launch_arg(local_emit_workspace),
-            launch_arg(selected_slot_ids_out),
+        adapter_collect_threshold_slots_kernel(
+            block_dim,
+            stream,
+            slot_meta,
+            blocked_mask,
+            search_start,
+            selection_state,
+            local_offset_workspace,
+            local_emit_workspace,
+            selected_slot_ids_out,
             num_actual_blocks,
-            threshold,
-            static_cast<int32_t>(block_dim));
+            threshold);
     }
-    adapter_age_usage_entry<<<block_dim, nullptr, stream>>>(
-        launch_arg(slot_meta),
-        launch_arg(selection_state),
-        num_actual_blocks,
-        static_cast<int32_t>(block_dim));
-    adapter_finalize_selected_slots_entry<<<1, nullptr, stream>>>(
-        launch_arg(selection_state),
-        launch_arg(search_start),
-        launch_arg(selected_slot_ids_out),
-        num_actual_blocks,
-        count);
+    adapter_age_usage_kernel(block_dim, stream, slot_meta, selection_state, num_actual_blocks);
+    adapter_finalize_selected_slots_kernel(stream, selection_state, search_start, selected_slot_ids_out, num_actual_blocks, count);
 }
 
 void adapter_commit_load_metadata_kernel(
