@@ -9,7 +9,6 @@ import sys
 
 
 _EXPORTS = (
-    "_build_info",
     "inspect_load_requests",
     "inspect_save_requests",
     "pop_reusable_slots",
@@ -21,6 +20,8 @@ _SUPPORT_LIB_NAME = "libkv_cache_adapter_npu_custom_kernels.so"
 
 
 def _preload_support_lib(module_dir: pathlib.Path) -> None:
+    import torch_npu  # noqa: F401
+
     support_lib = module_dir / _SUPPORT_LIB_NAME
     if not support_lib.exists():
         raise ImportError(
@@ -64,7 +65,10 @@ def _dispatch(name: str, *args):
 
 
 def debug_build_info():
-    return _dispatch("_build_info")
+    build_info = getattr(_c_ops, f"{_prefix}_build_info", None)
+    if build_info is None:
+        return f"_build_info unavailable; loaded {getattr(_c_ops, '__file__', '<unknown>')}"
+    return build_info()
 
 
 def inspect_load_requests(*args):
