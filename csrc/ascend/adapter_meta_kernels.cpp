@@ -171,7 +171,7 @@ void debug_probe_pop_state(
   auto debug_workspace = torch::empty({40}, search_start.options());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_pop_reusable_slots_debug_probe");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_debug_pop_state_kernel(
         stream,
         slot_meta.data_ptr<kvca_slotmeta_t>(),
@@ -217,7 +217,7 @@ std::vector<torch::Tensor> inspect_load_requests(
   const auto block_dim = block_dim_for(logical_block_ids.numel());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_inspect_load_requests");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_inspect_load_requests_kernel(
         block_dim,
         stream,
@@ -254,7 +254,7 @@ std::vector<torch::Tensor> inspect_save_requests(
   const auto block_dim = block_dim_for(logical_block_ids.numel());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_inspect_save_requests");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_inspect_save_requests_kernel(
         block_dim,
         stream,
@@ -333,7 +333,7 @@ torch::Tensor pop_reusable_slots(
         selected_slot_ids);
   };
 
-  auto run_pop_reusable_slots = [&]() {
+  auto run_pop_reusable_slots = [=]() {
     kvcache_ops::adapter_mark_blocked_slots_kernel(
         block_dim,
         stream,
@@ -394,7 +394,7 @@ torch::Tensor pop_reusable_slots(
     {
       at_npu::native::OpCommand cmd;
       cmd.Name("kv_cache_adapter_pop_reusable_slots_mark_blocked_debug");
-      cmd.SetCustomHandler([&]() -> int {
+      cmd.SetCustomHandler([=]() -> int {
         kvcache_ops::adapter_mark_blocked_slots_kernel(
             block_dim,
             stream,
@@ -411,7 +411,7 @@ torch::Tensor pop_reusable_slots(
       {
         at_npu::native::OpCommand cmd;
         cmd.Name("kv_cache_adapter_pop_reusable_slots_count_debug");
-        cmd.SetCustomHandler([&, current_threshold]() -> int {
+        cmd.SetCustomHandler([=]() -> int {
           kvcache_ops::adapter_count_threshold_slots_kernel(
               block_dim,
               stream,
@@ -430,7 +430,7 @@ torch::Tensor pop_reusable_slots(
       {
         at_npu::native::OpCommand cmd;
         cmd.Name("kv_cache_adapter_pop_reusable_slots_plan_debug");
-        cmd.SetCustomHandler([&, current_threshold]() -> int {
+        cmd.SetCustomHandler([=]() -> int {
           kvcache_ops::adapter_plan_threshold_slots_kernel(
               stream,
               local_count_workspace.data_ptr<int64_t>(),
@@ -448,7 +448,7 @@ torch::Tensor pop_reusable_slots(
       {
         at_npu::native::OpCommand cmd;
         cmd.Name("kv_cache_adapter_pop_reusable_slots_collect_debug");
-        cmd.SetCustomHandler([&, current_threshold]() -> int {
+        cmd.SetCustomHandler([=]() -> int {
           kvcache_ops::adapter_collect_threshold_slots_kernel(
               block_dim,
               stream,
@@ -473,7 +473,7 @@ torch::Tensor pop_reusable_slots(
     {
       at_npu::native::OpCommand cmd;
       cmd.Name("kv_cache_adapter_pop_reusable_slots_age_debug");
-      cmd.SetCustomHandler([&]() -> int {
+      cmd.SetCustomHandler([=]() -> int {
         kvcache_ops::adapter_age_usage_kernel(
             block_dim,
             stream,
@@ -488,7 +488,7 @@ torch::Tensor pop_reusable_slots(
     {
       at_npu::native::OpCommand cmd;
       cmd.Name("kv_cache_adapter_pop_reusable_slots_finalize_debug");
-      cmd.SetCustomHandler([&]() -> int {
+      cmd.SetCustomHandler([=]() -> int {
         kvcache_ops::adapter_finalize_selected_slots_kernel(
             stream,
             selection_state.data_ptr<int64_t>(),
@@ -543,7 +543,7 @@ torch::Tensor pop_reusable_slots(
   } else {
     at_npu::native::OpCommand cmd;
     cmd.Name("kv_cache_adapter_pop_reusable_slots");
-    cmd.SetCustomHandler([&]() -> int {
+    cmd.SetCustomHandler([=]() -> int {
       run_pop_reusable_slots();
       return 0;
     });
@@ -565,7 +565,7 @@ torch::Tensor debug_mark_blocked_slots(torch::Tensor blocked_slot_ids, int64_t n
   const auto block_dim = block_dim_for(blocked_slot_ids.numel());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_mark_blocked_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_mark_blocked_slots_kernel(
         block_dim,
         stream,
@@ -601,7 +601,7 @@ torch::Tensor debug_count_threshold_slots(
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_count_threshold_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_count_threshold_slots_kernel(
         block_dim,
         stream,
@@ -636,7 +636,7 @@ std::vector<torch::Tensor> debug_plan_threshold_slots(
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_plan_threshold_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_plan_threshold_slots_kernel(
         stream,
         local_count_workspace.data_ptr<int64_t>(),
@@ -684,7 +684,7 @@ torch::Tensor debug_collect_threshold_slots(
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_collect_threshold_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_collect_threshold_slots_kernel(
         block_dim,
         stream,
@@ -715,7 +715,7 @@ void debug_age_usage(torch::Tensor slot_meta, torch::Tensor selection_state) {
   const auto block_dim = block_dim_for(slot_meta.numel());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_age_usage");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_age_usage_kernel(
         block_dim,
         stream,
@@ -748,7 +748,7 @@ void debug_finalize_selected_slots(
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_debug_finalize_selected_slots");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_finalize_selected_slots_kernel(
         stream,
         selection_state.data_ptr<int64_t>(),
@@ -790,7 +790,7 @@ void commit_load_metadata(
       std::max<int64_t>(std::max(evicted_logical_block_ids.numel(), miss_logical_block_ids.numel()), hit_slot_ids.numel()));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_commit_load_metadata");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_commit_load_metadata_kernel(
         block_dim,
         stream,
@@ -835,7 +835,7 @@ void commit_save_metadata(
   const auto block_dim = block_dim_for(std::max<int64_t>(evicted_logical_block_ids.numel(), logical_block_ids.numel()));
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_commit_save_metadata");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_commit_save_metadata_kernel(
         block_dim,
         stream,
@@ -869,7 +869,7 @@ void release_metadata(
   const auto block_dim = block_dim_for(logical_block_ids.numel());
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_release_metadata");
-  cmd.SetCustomHandler([&]() -> int {
+  cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_release_metadata_kernel(
         block_dim,
         stream,
