@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
+import json
 import pathlib
 from dataclasses import dataclass
 from typing import Callable
@@ -206,23 +208,101 @@ def _profile_runtime_step(
 
 
 def _make_profiler(args: argparse.Namespace, trace_dir: pathlib.Path):
-    if profile is None or ProfilerActivity is None or schedule is None or tensorboard_trace_handler is None:
+    if profile is None or ProfilerActivity is None or schedule is None:
         raise SystemExit(f"torch_npu profiler is unavailable: {_IMPORT_ERROR!r}")
+    trace_handler = None
+    if not args.no_trace:
+        if tensorboard_trace_handler is None:
+            raise SystemExit(f"torch_npu tensorboard trace handler is unavailable: {_IMPORT_ERROR!r}")
+        trace_handler = tensorboard_trace_handler(str(trace_dir))
     return profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
         schedule=schedule(wait=args.wait, warmup=args.warmup, active=args.active, repeat=args.repeat),
-        on_trace_ready=tensorboard_trace_handler(str(trace_dir)),
+        on_trace_ready=trace_handler,
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
         with_stack=args.with_stack,
     )
 
 
-def _print_summary(prof, *, sort_by: str, row_limit: int) -> None:
-    try:
-        print(prof.key_averages().table(sort_by=sort_by, row_limit=row_limit))
-    except Exception as exc:  # pragma: no cover - profiler-version dependent
-        print(f"could not print profiler summary: {exc!r}")
+def _event_value(event, *names: str):
+    for name in names:
+        if hasattr(event, name):
+            value = getattr(event, name)
+            if value is not None and not callable(value):
+                return value
+    return 0
+
+
+def _event_rows(prof) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for event in prof.key_averages():
+        rows.append({
+            "key": str(_event_value(event, "key", "name")),
+            "count": int(_event_value(event, "count")),
+            "self_npu_time_total_us": float(_event_value(event, "self_npu_time_total", "self_device_time_total")),
+            "npu_time_total_us": float(_event_value(event, "npu_time_total", "device_time_total")),
+            "self_cpu_time_total_us": float(_event_value(event, "self_cpu_time_total")),
+            "cpu_time_total_us": float(_event_value(event, "cpu_time_total")),
+            "cpu_memory_usage": int(_event_value(event, "cpu_memory_usage")),
+            "npu_memory_usage": int(_event_value(event, "npu_memory_usage", "device_memory_usage")),
+            "input_shapes": str(_event_value(event, "input_shapes")),
+        })
+    return rows
+
+
+def _sort_rows(rows: list[dict[str, object]], sort_by: str) -> list[dict[str, object]]:
+    key = sort_by
+    if key.endswith("_total"):
+        key = f"{key}_us"
+    if key == "self_device_time_total_us":
+        key = "self_npu_time_total_us"
+    elif key == "device_time_total_us":
+        key = "npu_time_total_us"
+    if rows and key not in rows[0]:
+        key = "self_npu_time_total_us"
+    return sorted(rows, key=lambda row: float(row.get(key, 0.0)), reverse=True)
+
+
+def _summary_table(prof, *, sort_by: str, row_limit: int) -> str:
+    key_averages = prof.key_averages()
+    candidates = [sort_by, "self_npu_time_total", "self_device_time_total", "self_cpu_time_total", "cpu_time_total"]
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return key_averages.table(sort_by=candidate, row_limit=row_limit)
+        except Exception as exc:  # pragma: no cover - profiler-version dependent
+            last_error = exc
+    return f"could not render profiler summary table: {last_error!r}"
+
+
+def _write_summary(prof, *, trace_dir: pathlib.Path, sort_by: str, row_limit: int) -> None:
+    table = _summary_table(prof, sort_by=sort_by, row_limit=row_limit)
+    print(table)
+    table_path = trace_dir / "summary.txt"
+    table_path.write_text(table + "\n", encoding="utf-8")
+
+    rows = _sort_rows(_event_rows(prof), sort_by)
+    json_path = trace_dir / "summary.json"
+    json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+
+    csv_path = trace_dir / "summary.csv"
+    fieldnames = [
+        "key",
+        "count",
+        "self_npu_time_total_us",
+        "npu_time_total_us",
+        "self_cpu_time_total_us",
+        "cpu_time_total_us",
+        "cpu_memory_usage",
+        "npu_memory_usage",
+        "input_shapes",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"profile summaries written to: {table_path}, {csv_path}, {json_path}")
 
 
 def profile_runtime(args: argparse.Namespace, device: torch.device) -> None:
@@ -266,11 +346,14 @@ def profile_runtime(args: argparse.Namespace, device: torch.device) -> None:
                 )
                 prof.step()
         _synchronize(device)
-        _print_summary(prof, sort_by=args.sort_by, row_limit=args.row_limit)
+        _write_summary(prof, trace_dir=trace_dir, sort_by=args.sort_by, row_limit=args.row_limit)
     finally:
         adapter.shutdown()
         _synchronize(device)
-    print(f"runtime trace written to: {trace_dir}")
+    if args.no_trace:
+        print(f"runtime summaries written to: {trace_dir}")
+    else:
+        print(f"runtime trace and summaries written to: {trace_dir}")
 
 
 def profile_pop(args: argparse.Namespace, device: torch.device) -> None:
@@ -304,8 +387,11 @@ def profile_pop(args: argparse.Namespace, device: torch.device) -> None:
                 )
             prof.step()
     _synchronize(device)
-    _print_summary(prof, sort_by=args.sort_by, row_limit=args.row_limit)
-    print(f"pop trace written to: {trace_dir}")
+    _write_summary(prof, trace_dir=trace_dir, sort_by=args.sort_by, row_limit=args.row_limit)
+    if args.no_trace:
+        print(f"pop summaries written to: {trace_dir}")
+    else:
+        print(f"pop trace and summaries written to: {trace_dir}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -320,6 +406,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--with-stack", action="store_true")
+    parser.add_argument("--no-trace", action="store_true")
     parser.add_argument("--sort-by", default="self_npu_time_total")
     parser.add_argument("--row-limit", type=int, default=40)
 
