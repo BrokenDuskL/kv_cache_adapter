@@ -80,30 +80,6 @@ def pop_reusable_slots(*args):
     return _dispatch("pop_reusable_slots", *args)
 
 
-def _debug_mark_blocked_slots(*args):
-    return _dispatch("_debug_mark_blocked_slots", *args)
-
-
-def _debug_count_threshold_slots(*args):
-    return _dispatch("_debug_count_threshold_slots", *args)
-
-
-def _debug_plan_threshold_slots(*args):
-    return _dispatch("_debug_plan_threshold_slots", *args)
-
-
-def _debug_collect_threshold_slots(*args):
-    return _dispatch("_debug_collect_threshold_slots", *args)
-
-
-def _debug_age_usage(*args):
-    return _dispatch("_debug_age_usage", *args)
-
-
-def _debug_finalize_selected_slots(*args):
-    return _dispatch("_debug_finalize_selected_slots", *args)
-
-
 def commit_load_metadata(*args):
     return _dispatch("commit_load_metadata", *args)
 
