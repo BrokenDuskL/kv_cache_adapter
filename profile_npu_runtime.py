@@ -9,17 +9,28 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-from torch.profiler import record_function
+from torch.profiler import (
+    ProfilerActivity as TorchProfilerActivity,
+    profile as torch_profile,
+    record_function,
+    schedule as torch_schedule,
+    tensorboard_trace_handler as torch_tensorboard_trace_handler,
+)
 
 try:
     import torch_npu  # noqa: F401
-    from torch_npu.profiler import ProfilerActivity, profile, schedule, tensorboard_trace_handler
+    from torch_npu.profiler import (
+        ProfilerActivity as NpuProfilerActivity,
+        profile as npu_profile,
+        schedule as npu_schedule,
+        tensorboard_trace_handler as npu_tensorboard_trace_handler,
+    )
 except Exception as exc:  # pragma: no cover - depends on Ascend runtime
     torch_npu = None
-    ProfilerActivity = None
-    profile = None
-    schedule = None
-    tensorboard_trace_handler = None
+    NpuProfilerActivity = None
+    npu_profile = None
+    npu_schedule = None
+    npu_tensorboard_trace_handler = None
     _IMPORT_ERROR = exc
 else:
     _IMPORT_ERROR = None
@@ -207,17 +218,39 @@ def _profile_runtime_step(
             adapter.save(save_ids, save_payload)
 
 
+def _torch_profiler_activities() -> list[TorchProfilerActivity]:
+    activities = [TorchProfilerActivity.CPU]
+    if hasattr(TorchProfilerActivity, "NPU"):
+        activities.append(TorchProfilerActivity.NPU)
+    elif hasattr(TorchProfilerActivity, "PrivateUse1"):
+        activities.append(TorchProfilerActivity.PrivateUse1)
+    return activities
+
+
 def _make_profiler(args: argparse.Namespace, trace_dir: pathlib.Path):
-    if profile is None or ProfilerActivity is None or schedule is None:
+    if args.profiler == "torch":
+        trace_handler = None
+        if not args.no_trace:
+            trace_handler = torch_tensorboard_trace_handler(str(trace_dir))
+        return torch_profile(
+            activities=_torch_profiler_activities(),
+            schedule=torch_schedule(wait=args.wait, warmup=args.warmup, active=args.active, repeat=args.repeat),
+            on_trace_ready=trace_handler,
+            record_shapes=args.record_shapes,
+            profile_memory=args.profile_memory,
+            with_stack=args.with_stack,
+        )
+
+    if npu_profile is None or NpuProfilerActivity is None or npu_schedule is None:
         raise SystemExit(f"torch_npu profiler is unavailable: {_IMPORT_ERROR!r}")
     trace_handler = None
     if not args.no_trace:
-        if tensorboard_trace_handler is None:
+        if npu_tensorboard_trace_handler is None:
             raise SystemExit(f"torch_npu tensorboard trace handler is unavailable: {_IMPORT_ERROR!r}")
-        trace_handler = tensorboard_trace_handler(str(trace_dir))
-    return profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.NPU],
-        schedule=schedule(wait=args.wait, warmup=args.warmup, active=args.active, repeat=args.repeat),
+        trace_handler = npu_tensorboard_trace_handler(str(trace_dir))
+    return npu_profile(
+        activities=[NpuProfilerActivity.CPU, NpuProfilerActivity.NPU],
+        schedule=npu_schedule(wait=args.wait, warmup=args.warmup, active=args.active, repeat=args.repeat),
         on_trace_ready=trace_handler,
         record_shapes=args.record_shapes,
         profile_memory=args.profile_memory,
@@ -237,11 +270,25 @@ def _event_value(event, *names: str):
 def _event_rows(prof) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for event in prof.key_averages():
+        self_device_time = float(_event_value(
+            event,
+            "self_npu_time_total",
+            "self_device_time_total",
+            "self_privateuse1_time_total",
+            "self_cuda_time_total",
+        ))
+        device_time = float(_event_value(
+            event,
+            "npu_time_total",
+            "device_time_total",
+            "privateuse1_time_total",
+            "cuda_time_total",
+        ))
         rows.append({
             "key": str(_event_value(event, "key", "name")),
             "count": int(_event_value(event, "count")),
-            "self_npu_time_total_us": float(_event_value(event, "self_npu_time_total", "self_device_time_total")),
-            "npu_time_total_us": float(_event_value(event, "npu_time_total", "device_time_total")),
+            "self_npu_time_total_us": self_device_time,
+            "npu_time_total_us": device_time,
             "self_cpu_time_total_us": float(_event_value(event, "self_cpu_time_total")),
             "cpu_time_total_us": float(_event_value(event, "cpu_time_total")),
             "cpu_memory_usage": int(_event_value(event, "cpu_memory_usage")),
@@ -257,7 +304,15 @@ def _sort_rows(rows: list[dict[str, object]], sort_by: str) -> list[dict[str, ob
         key = f"{key}_us"
     if key == "self_device_time_total_us":
         key = "self_npu_time_total_us"
+    elif key == "self_privateuse1_time_total_us":
+        key = "self_npu_time_total_us"
+    elif key == "self_cuda_time_total_us":
+        key = "self_npu_time_total_us"
     elif key == "device_time_total_us":
+        key = "npu_time_total_us"
+    elif key == "privateuse1_time_total_us":
+        key = "npu_time_total_us"
+    elif key == "cuda_time_total_us":
         key = "npu_time_total_us"
     if rows and key not in rows[0]:
         key = "self_npu_time_total_us"
@@ -266,7 +321,15 @@ def _sort_rows(rows: list[dict[str, object]], sort_by: str) -> list[dict[str, ob
 
 def _summary_table(prof, *, sort_by: str, row_limit: int) -> str:
     key_averages = prof.key_averages()
-    candidates = [sort_by, "self_npu_time_total", "self_device_time_total", "self_cpu_time_total", "cpu_time_total"]
+    candidates = [
+        sort_by,
+        "self_npu_time_total",
+        "self_privateuse1_time_total",
+        "self_device_time_total",
+        "self_cuda_time_total",
+        "self_cpu_time_total",
+        "cpu_time_total",
+    ]
     last_error: Exception | None = None
     for candidate in candidates:
         try:
@@ -277,6 +340,23 @@ def _summary_table(prof, *, sort_by: str, row_limit: int) -> str:
 
 
 def _write_summary(prof, *, trace_dir: pathlib.Path, sort_by: str, row_limit: int) -> None:
+    if not hasattr(prof, "key_averages"):
+        files = sorted(path for path in trace_dir.rglob("*") if path.is_file())
+        message = (
+            "This profiler object does not expose key_averages(); text CSV/JSON summaries cannot be "
+            "generated from it. Use --profiler torch for server-readable summaries, or inspect the "
+            "files exported by torch_npu.profiler below.\n"
+        )
+        if files:
+            message += "\n".join(str(path) for path in files)
+        else:
+            message += "No profiler output files were found."
+        print(message)
+        (trace_dir / "summary.txt").write_text(message + "\n", encoding="utf-8")
+        (trace_dir / "summary.csv").write_text("key,count,self_npu_time_total_us,npu_time_total_us\n", encoding="utf-8")
+        (trace_dir / "summary.json").write_text("[]\n", encoding="utf-8")
+        return
+
     table = _summary_table(prof, sort_by=sort_by, row_limit=row_limit)
     print(table)
     table_path = trace_dir / "summary.txt"
@@ -397,6 +477,7 @@ def profile_pop(args: argparse.Namespace, device: torch.device) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Profile KVCacheAdapter on Ascend NPU")
     parser.add_argument("--target", choices=("runtime", "pop", "both"), default="runtime")
+    parser.add_argument("--profiler", choices=("torch", "torch-npu"), default="torch")
     parser.add_argument("--output-dir", default="./npu_profile")
     parser.add_argument("--wait", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=5)
@@ -407,7 +488,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--with-stack", action="store_true")
     parser.add_argument("--no-trace", action="store_true")
-    parser.add_argument("--sort-by", default="self_npu_time_total")
+    parser.add_argument("--sort-by", default="self_privateuse1_time_total")
     parser.add_argument("--row-limit", type=int, default=40)
 
     parser.add_argument("--num-actual-blocks", type=int, default=4096)
