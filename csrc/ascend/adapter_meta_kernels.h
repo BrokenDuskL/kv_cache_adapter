@@ -1,10 +1,7 @@
 #pragma once
 
 #include <torch/extension.h>
-#include <string>
 #include <vector>
-
-std::string npu_custom_ops_build_info();
 
 std::vector<torch::Tensor> inspect_load_requests(
     torch::Tensor logical_to_physical,
@@ -20,6 +17,40 @@ torch::Tensor pop_reusable_slots(
     torch::Tensor slot_meta,
     torch::Tensor search_start,
     torch::Tensor blocked_slot_ids,
+    int64_t count);
+
+torch::Tensor debug_mark_blocked_slots(torch::Tensor blocked_slot_ids, int64_t num_actual_blocks);
+
+torch::Tensor debug_count_threshold_slots(
+    torch::Tensor slot_meta,
+    torch::Tensor blocked_mask,
+    torch::Tensor search_start,
+    torch::Tensor selection_state,
+    int64_t threshold);
+
+std::vector<torch::Tensor> debug_plan_threshold_slots(
+    torch::Tensor local_count_workspace,
+    torch::Tensor selection_state,
+    int64_t count,
+    int64_t threshold);
+
+torch::Tensor debug_collect_threshold_slots(
+    torch::Tensor slot_meta,
+    torch::Tensor blocked_mask,
+    torch::Tensor search_start,
+    torch::Tensor selection_state,
+    torch::Tensor local_offset_workspace,
+    torch::Tensor local_emit_workspace,
+    torch::Tensor selected_slot_ids,
+    int64_t threshold);
+
+void debug_age_usage(torch::Tensor slot_meta, torch::Tensor selection_state);
+
+void debug_finalize_selected_slots(
+    torch::Tensor selection_state,
+    torch::Tensor search_start,
+    torch::Tensor selected_slot_ids,
+    int64_t num_actual_blocks,
     int64_t count);
 
 void commit_load_metadata(

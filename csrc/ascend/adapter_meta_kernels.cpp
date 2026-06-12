@@ -102,10 +102,6 @@ void debug_sync_stream(aclrtStream stream, const char *stage) {
   sync_stream_checked(stream, stage, true);
 }
 
-std::string npu_custom_ops_build_info() {
-  return std::string("kv_cache_adapter_npu_custom_ops built ") + __DATE__ + " " + __TIME__ + " from " + __FILE__;
-}
-
 torch::ScalarType slot_meta_scalar_type() {
 #if KVCA_SLOT_META_BITS == 8
   return torch::kUInt8;
@@ -557,6 +553,213 @@ torch::Tensor pop_reusable_slots(
     }
   }
   return selected_slot_ids;
+}
+
+torch::Tensor debug_mark_blocked_slots(torch::Tensor blocked_slot_ids, int64_t num_actual_blocks) {
+  check_tensor_1d(blocked_slot_ids, torch::kInt64, "blocked_slot_ids");
+  TORCH_CHECK(num_actual_blocks >= 0, "num_actual_blocks must be non-negative");
+
+  auto blocked_mask = torch::zeros({num_actual_blocks}, blocked_slot_ids.options().dtype(torch::kUInt8));
+  const c10::OptionalDeviceGuard device_guard(blocked_slot_ids.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const auto block_dim = block_dim_for(blocked_slot_ids.numel());
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_mark_blocked_slots");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_mark_blocked_slots_kernel(
+        block_dim,
+        stream,
+        blocked_slot_ids.data_ptr<int64_t>(),
+        blocked_mask.data_ptr<uint8_t>(),
+        static_cast<int32_t>(blocked_slot_ids.numel()));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_mark_blocked_slots:done", false);
+  return blocked_mask;
+}
+
+torch::Tensor debug_count_threshold_slots(
+    torch::Tensor slot_meta,
+    torch::Tensor blocked_mask,
+    torch::Tensor search_start,
+    torch::Tensor selection_state,
+    int64_t threshold) {
+  check_tensor_1d(slot_meta, slot_meta_scalar_type(), "slot_meta");
+  check_tensor_1d(blocked_mask, torch::kUInt8, "blocked_mask");
+  check_tensor_1d(search_start, torch::kInt64, "search_start");
+  check_tensor_1d(selection_state, torch::kInt64, "selection_state");
+  check_same_device(slot_meta, blocked_mask, "slot_meta", "blocked_mask");
+  check_same_device(slot_meta, search_start, "slot_meta", "search_start");
+  check_same_device(slot_meta, selection_state, "slot_meta", "selection_state");
+  TORCH_CHECK(search_start.numel() == 1, "search_start must contain one value");
+  TORCH_CHECK(selection_state.numel() == 2, "selection_state must contain selected_count and threshold");
+
+  const auto block_dim = block_dim_for(slot_meta.numel());
+  auto local_count_workspace = torch::zeros({block_dim}, search_start.options());
+  const c10::OptionalDeviceGuard device_guard(slot_meta.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_count_threshold_slots");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_count_threshold_slots_kernel(
+        block_dim,
+        stream,
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
+        blocked_mask.data_ptr<uint8_t>(),
+        search_start.data_ptr<int64_t>(),
+        selection_state.data_ptr<int64_t>(),
+        local_count_workspace.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()),
+        static_cast<int32_t>(threshold));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_count_threshold_slots:done", false);
+  return local_count_workspace;
+}
+
+std::vector<torch::Tensor> debug_plan_threshold_slots(
+    torch::Tensor local_count_workspace,
+    torch::Tensor selection_state,
+    int64_t count,
+    int64_t threshold) {
+  check_tensor_1d(local_count_workspace, torch::kInt64, "local_count_workspace");
+  check_tensor_1d(selection_state, torch::kInt64, "selection_state");
+  check_same_device(local_count_workspace, selection_state, "local_count_workspace", "selection_state");
+  TORCH_CHECK(selection_state.numel() == 2, "selection_state must contain selected_count and threshold");
+  TORCH_CHECK(count >= 0, "count must be non-negative");
+
+  auto local_offset_workspace = torch::zeros_like(local_count_workspace);
+  auto local_emit_workspace = torch::zeros_like(local_count_workspace);
+  const c10::OptionalDeviceGuard device_guard(local_count_workspace.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_plan_threshold_slots");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_plan_threshold_slots_kernel(
+        stream,
+        local_count_workspace.data_ptr<int64_t>(),
+        local_offset_workspace.data_ptr<int64_t>(),
+        local_emit_workspace.data_ptr<int64_t>(),
+        selection_state.data_ptr<int64_t>(),
+        static_cast<int32_t>(local_count_workspace.numel()),
+        static_cast<int32_t>(count),
+        static_cast<int32_t>(threshold));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_plan_threshold_slots:done", false);
+  return {local_offset_workspace, local_emit_workspace, selection_state};
+}
+
+torch::Tensor debug_collect_threshold_slots(
+    torch::Tensor slot_meta,
+    torch::Tensor blocked_mask,
+    torch::Tensor search_start,
+    torch::Tensor selection_state,
+    torch::Tensor local_offset_workspace,
+    torch::Tensor local_emit_workspace,
+    torch::Tensor selected_slot_ids,
+    int64_t threshold) {
+  check_tensor_1d(slot_meta, slot_meta_scalar_type(), "slot_meta");
+  check_tensor_1d(blocked_mask, torch::kUInt8, "blocked_mask");
+  check_tensor_1d(search_start, torch::kInt64, "search_start");
+  check_tensor_1d(selection_state, torch::kInt64, "selection_state");
+  check_tensor_1d(local_offset_workspace, torch::kInt64, "local_offset_workspace");
+  check_tensor_1d(local_emit_workspace, torch::kInt64, "local_emit_workspace");
+  check_tensor_1d(selected_slot_ids, torch::kInt64, "selected_slot_ids");
+  check_same_device(slot_meta, blocked_mask, "slot_meta", "blocked_mask");
+  check_same_device(slot_meta, search_start, "slot_meta", "search_start");
+  check_same_device(slot_meta, selection_state, "slot_meta", "selection_state");
+  check_same_device(slot_meta, local_offset_workspace, "slot_meta", "local_offset_workspace");
+  check_same_device(slot_meta, local_emit_workspace, "slot_meta", "local_emit_workspace");
+  check_same_device(slot_meta, selected_slot_ids, "slot_meta", "selected_slot_ids");
+  TORCH_CHECK(search_start.numel() == 1, "search_start must contain one value");
+  TORCH_CHECK(selection_state.numel() == 2, "selection_state must contain selected_count and threshold");
+  TORCH_CHECK(local_offset_workspace.numel() == local_emit_workspace.numel(), "workspace sizes must match");
+
+  const auto block_dim = static_cast<uint32_t>(local_emit_workspace.numel());
+  const c10::OptionalDeviceGuard device_guard(slot_meta.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_collect_threshold_slots");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_collect_threshold_slots_kernel(
+        block_dim,
+        stream,
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
+        blocked_mask.data_ptr<uint8_t>(),
+        search_start.data_ptr<int64_t>(),
+        selection_state.data_ptr<int64_t>(),
+        local_offset_workspace.data_ptr<int64_t>(),
+        local_emit_workspace.data_ptr<int64_t>(),
+        selected_slot_ids.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()),
+        static_cast<int32_t>(threshold));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_collect_threshold_slots:done", false);
+  return selected_slot_ids;
+}
+
+void debug_age_usage(torch::Tensor slot_meta, torch::Tensor selection_state) {
+  check_tensor_1d(slot_meta, slot_meta_scalar_type(), "slot_meta");
+  check_tensor_1d(selection_state, torch::kInt64, "selection_state");
+  check_same_device(slot_meta, selection_state, "slot_meta", "selection_state");
+  TORCH_CHECK(selection_state.numel() == 2, "selection_state must contain selected_count and threshold");
+
+  const c10::OptionalDeviceGuard device_guard(slot_meta.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  const auto block_dim = block_dim_for(slot_meta.numel());
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_age_usage");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_age_usage_kernel(
+        block_dim,
+        stream,
+        slot_meta.data_ptr<kvca_slotmeta_t>(),
+        selection_state.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_age_usage:done", false);
+}
+
+void debug_finalize_selected_slots(
+    torch::Tensor selection_state,
+    torch::Tensor search_start,
+    torch::Tensor selected_slot_ids,
+    int64_t num_actual_blocks,
+    int64_t count) {
+  check_tensor_1d(selection_state, torch::kInt64, "selection_state");
+  check_tensor_1d(search_start, torch::kInt64, "search_start");
+  check_tensor_1d(selected_slot_ids, torch::kInt64, "selected_slot_ids");
+  check_same_device(selection_state, search_start, "selection_state", "search_start");
+  check_same_device(selection_state, selected_slot_ids, "selection_state", "selected_slot_ids");
+  TORCH_CHECK(selection_state.numel() == 2, "selection_state must contain selected_count and threshold");
+  TORCH_CHECK(search_start.numel() == 1, "search_start must contain one value");
+  TORCH_CHECK(num_actual_blocks >= 0, "num_actual_blocks must be non-negative");
+  TORCH_CHECK(count >= 0, "count must be non-negative");
+
+  const c10::OptionalDeviceGuard device_guard(selection_state.device());
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  at_npu::native::OpCommand cmd;
+  cmd.Name("kv_cache_adapter_debug_finalize_selected_slots");
+  cmd.SetCustomHandler([&]() -> int {
+    kvcache_ops::adapter_finalize_selected_slots_kernel(
+        stream,
+        selection_state.data_ptr<int64_t>(),
+        search_start.data_ptr<int64_t>(),
+        selected_slot_ids.data_ptr<int64_t>(),
+        static_cast<int32_t>(num_actual_blocks),
+        static_cast<int32_t>(count));
+    return 0;
+  });
+  cmd.Run();
+  sync_stream_checked(stream, "debug_finalize_selected_slots:done", false);
 }
 
 void commit_load_metadata(

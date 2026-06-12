@@ -18,3 +18,14 @@ target_include_directories(kv_cache_adapter_npu_custom_kernels
   PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+target_link_directories(kv_cache_adapter_npu_custom_kernels
+  PRIVATE
+  ${ASCEND_CANN_PACKAGE_PATH}/lib64
+  ${ASCEND_CANN_PACKAGE_PATH}/${ARCH_SUBDIR}/devlib
+)
+
+target_link_libraries(kv_cache_adapter_npu_custom_kernels
+  PRIVATE
+  ascendcl
+)
