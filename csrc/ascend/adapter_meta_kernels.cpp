@@ -350,6 +350,7 @@ torch::Tensor pop_reusable_slots(
           selection_state.data_ptr<int64_t>(),
           local_count_workspace.data_ptr<int64_t>(),
           static_cast<int32_t>(slot_meta.numel()),
+          static_cast<int32_t>(count),
           threshold);
       kvcache_ops::adapter_plan_threshold_slots_kernel(
           stream,
@@ -421,6 +422,7 @@ torch::Tensor pop_reusable_slots(
               selection_state.data_ptr<int64_t>(),
               local_count_workspace.data_ptr<int64_t>(),
               static_cast<int32_t>(slot_meta.numel()),
+              static_cast<int32_t>(count),
               current_threshold);
           return 0;
         });
@@ -610,6 +612,7 @@ torch::Tensor debug_count_threshold_slots(
         search_start.data_ptr<int64_t>(),
         selection_state.data_ptr<int64_t>(),
         local_count_workspace.data_ptr<int64_t>(),
+        static_cast<int32_t>(slot_meta.numel()),
         static_cast<int32_t>(slot_meta.numel()),
         static_cast<int32_t>(threshold));
     return 0;

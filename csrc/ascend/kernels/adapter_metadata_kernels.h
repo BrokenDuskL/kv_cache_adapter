@@ -80,6 +80,7 @@ void adapter_count_threshold_slots_kernel(
     const int64_t *selection_state,
     int64_t *local_count_workspace,
     int32_t num_actual_blocks,
+    int32_t requested_count,
     int32_t threshold);
 
 void adapter_plan_threshold_slots_kernel(
