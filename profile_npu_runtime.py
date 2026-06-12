@@ -49,6 +49,13 @@ class RuntimeConfig:
     seed: int
 
 
+@dataclass(frozen=True)
+class RuntimeStep:
+    load_ids: torch.Tensor | None
+    save_ids: torch.Tensor | None
+    save_payload: torch.Tensor | None
+
+
 def _device() -> torch.device:
     if torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available():
         raise SystemExit(f"NPU is required; torch_npu profiler import failed: {_IMPORT_ERROR!r}")
@@ -193,29 +200,71 @@ def _run_runtime_warmup(
     _synchronize(device)
 
 
-def _profile_runtime_step(
+def _prepare_runtime_adapter(
+    config: RuntimeConfig,
+    *,
+    device: torch.device,
+    generator: torch.Generator,
+    prewarm_steps: int,
+) -> tuple[KVCacheAdapter, torch.Tensor]:
+    all_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
+    adapter = _make_adapter(config, device=device)
+    initial = all_ids[: config.num_actual_blocks]
+    adapter.load(initial)
+    _synchronize(device)
+    adapter.release(initial)
+    _run_runtime_warmup(
+        adapter=adapter,
+        all_ids=all_ids,
+        config=config,
+        generator=generator,
+        steps=prewarm_steps,
+        device=device,
+    )
+    return adapter, all_ids
+
+
+def _build_runtime_steps(
     *,
     adapter: KVCacheAdapter,
     all_ids: torch.Tensor,
     config: RuntimeConfig,
     generator: torch.Generator,
-    device: torch.device,
     runtime_op: str,
-) -> None:
-    if runtime_op in {"load", "both"}:
-        with record_function("kvca_profile.prepare_load_ids"):
+    steps: int,
+    device: torch.device,
+) -> list[RuntimeStep]:
+    runtime_steps: list[RuntimeStep] = []
+    for _ in range(steps):
+        load_ids = None
+        save_ids = None
+        save_payload = None
+        if runtime_op in {"load", "both"}:
             load_ids = _sample_batch_ids(adapter, all_ids, config.batch_size, config.hit_rate, generator)
-        with record_function("kvca_profile.adapter_load"):
             adapter.load(load_ids)
-        with record_function("kvca_profile.adapter_release"):
             adapter.release(load_ids)
-    if runtime_op in {"save", "both"}:
-        with record_function("kvca_profile.prepare_save_ids"):
+        if runtime_op in {"save", "both"}:
             save_ids = _sample_batch_ids(adapter, all_ids, config.batch_size, config.hit_rate, generator)
-        with record_function("kvca_profile.prepare_save_payload"):
             save_payload = _random_payloads(config, generator, device=device)
-        with record_function("kvca_profile.adapter_save"):
             adapter.save(save_ids, save_payload)
+        runtime_steps.append(RuntimeStep(load_ids=load_ids, save_ids=save_ids, save_payload=save_payload))
+    _synchronize(device)
+    return runtime_steps
+
+
+def _profile_runtime_step(
+    *,
+    adapter: KVCacheAdapter,
+    runtime_step: RuntimeStep,
+) -> None:
+    if runtime_step.load_ids is not None:
+        with record_function("kvca_profile.adapter_load"):
+            adapter.load(runtime_step.load_ids)
+        with record_function("kvca_profile.adapter_release"):
+            adapter.release(runtime_step.load_ids)
+    if runtime_step.save_ids is not None and runtime_step.save_payload is not None:
+        with record_function("kvca_profile.adapter_save"):
+            adapter.save(runtime_step.save_ids, runtime_step.save_payload)
 
 
 def _torch_profiler_activities() -> list[TorchProfilerActivity]:
@@ -394,35 +443,45 @@ def profile_runtime(args: argparse.Namespace, device: torch.device) -> None:
         hit_rate=args.hit_rate,
         seed=args.seed,
     )
-    all_ids = torch.arange(config.num_logical_blocks, dtype=torch.int64, device=device)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(config.seed)
-    adapter = _make_adapter(config, device=device)
     trace_dir = pathlib.Path(args.output_dir) / "runtime"
     trace_dir.mkdir(parents=True, exist_ok=True)
+    total_steps = (args.wait + args.warmup + args.active) * args.repeat
+    planning_generator = torch.Generator(device="cpu")
+    planning_generator.manual_seed(config.seed)
+    planning_adapter, planning_all_ids = _prepare_runtime_adapter(
+        config,
+        device=device,
+        generator=planning_generator,
+        prewarm_steps=args.prewarm_steps,
+    )
     try:
-        initial = all_ids[: config.num_actual_blocks]
-        adapter.load(initial)
-        _synchronize(device)
-        adapter.release(initial)
-        _run_runtime_warmup(
-            adapter=adapter,
-            all_ids=all_ids,
+        runtime_steps = _build_runtime_steps(
+            adapter=planning_adapter,
+            all_ids=planning_all_ids,
             config=config,
-            generator=generator,
-            steps=args.prewarm_steps,
+            generator=planning_generator,
+            runtime_op=args.runtime_op,
+            steps=total_steps,
             device=device,
         )
-        total_steps = (args.wait + args.warmup + args.active) * args.repeat
+    finally:
+        planning_adapter.shutdown()
+        _synchronize(device)
+
+    profile_generator = torch.Generator(device="cpu")
+    profile_generator.manual_seed(config.seed)
+    adapter, _ = _prepare_runtime_adapter(
+        config,
+        device=device,
+        generator=profile_generator,
+        prewarm_steps=args.prewarm_steps,
+    )
+    try:
         with _make_profiler(args, trace_dir) as prof:
-            for _ in range(total_steps):
+            for runtime_step in runtime_steps:
                 _profile_runtime_step(
                     adapter=adapter,
-                    all_ids=all_ids,
-                    config=config,
-                    generator=generator,
-                    device=device,
-                    runtime_op=args.runtime_op,
+                    runtime_step=runtime_step,
                 )
                 prof.step()
         _synchronize(device)

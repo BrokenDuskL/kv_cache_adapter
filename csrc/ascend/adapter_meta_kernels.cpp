@@ -179,11 +179,16 @@ torch::Tensor pop_reusable_slots(
 
   const c10::OptionalDeviceGuard device_guard(slot_meta.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  auto block_dim = block_dim_for(std::min<int64_t>(slot_meta.numel(), count));
+  if (slot_meta.numel() < 128) {
+    block_dim = 1;
+  }
 
   at_npu::native::OpCommand cmd;
   cmd.Name("kv_cache_adapter_pop_reusable_slots");
   cmd.SetCustomHandler([=]() -> int {
     kvcache_ops::adapter_pop_reusable_slots_kernel(
+        block_dim,
         stream,
         slot_meta.data_ptr<kvca_slotmeta_t>(),
         search_start.data_ptr<int64_t>(),

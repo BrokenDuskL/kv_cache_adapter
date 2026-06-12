@@ -169,15 +169,13 @@ extern "C" __global__ __aicore__ void adapter_pop_reusable_slots_entry(
     GM_ADDR selected_slot_ids_out_addr,
     int32_t num_actual_blocks,
     int32_t num_blocked_slot_ids,
-    int32_t count) {
-    if (AscendC::GetBlockIdx() != 0) {
-        return;
-    }
-
+    int32_t count,
+    int32_t block_dim) {
     __gm__ kvca_slotmeta_t *slot_meta = reinterpret_cast<__gm__ kvca_slotmeta_t *>(slot_meta_addr);
     __gm__ int64_t *search_start = reinterpret_cast<__gm__ int64_t *>(search_start_addr);
     __gm__ const int64_t *blocked_slot_ids = reinterpret_cast<__gm__ const int64_t *>(blocked_slot_ids_addr);
     __gm__ int64_t *selected_slot_ids_out = reinterpret_cast<__gm__ int64_t *>(selected_slot_ids_out_addr);
+    const int32_t core_index = static_cast<int32_t>(AscendC::GetBlockIdx());
 
     AscendC::TPipe pipe;
     AscendC::TBuf<> calc_buf;
@@ -190,6 +188,83 @@ extern "C" __global__ __aicore__ void adapter_pop_reusable_slots_entry(
     if (blocked_ids_in_local) {
         load_int64_tile_pad(blocked_ids_local, blocked_slot_ids, num_blocked_slot_ids);
         sync_pipe<AscendC::HardEvent::MTE2_S>(pipe);
+    }
+
+    if (block_dim > 1) {
+        const int64_t start = search_start[0];
+        int64_t local_selected = 0;
+        int32_t local_selected_threshold = -1;
+        for (int32_t index = core_index; index < count; index += block_dim) {
+            selected_slot_ids_out[index] = -1;
+        }
+
+        for (int32_t threshold = 0; threshold <= KVCA_USAGE_COUNT_MAX; ++threshold) {
+            for (int32_t rotated_pos = core_index; rotated_pos < num_actual_blocks; rotated_pos += block_dim) {
+                const int64_t output_index = local_selected * static_cast<int64_t>(block_dim) + core_index;
+                if (output_index >= count) {
+                    break;
+                }
+                const int32_t slot_id = static_cast<int32_t>((start + rotated_pos) % num_actual_blocks);
+                bool is_blocked = false;
+                if (blocked_ids_in_local) {
+                    for (int32_t blocked_index = 0; blocked_index < num_blocked_slot_ids; ++blocked_index) {
+                        if (blocked_ids_local(blocked_index) == static_cast<int64_t>(slot_id)) {
+                            is_blocked = true;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int32_t blocked_index = 0; blocked_index < num_blocked_slot_ids; ++blocked_index) {
+                        if (blocked_slot_ids[blocked_index] == static_cast<int64_t>(slot_id)) {
+                            is_blocked = true;
+                            break;
+                        }
+                    }
+                }
+                const kvca_slotmeta_t meta = slot_meta[slot_id];
+                if (!is_blocked &&
+                    unpack_pin_count(meta) == 0 &&
+                    unpack_usage_count(meta) == threshold) {
+                    selected_slot_ids_out[output_index] = static_cast<int64_t>(slot_id);
+                    if (output_index == count - 1) {
+                        search_start[0] = (static_cast<int64_t>(slot_id) + 1) % num_actual_blocks;
+                    }
+                    local_selected += 1;
+                    local_selected_threshold = threshold;
+                }
+            }
+            if (local_selected * static_cast<int64_t>(block_dim) + core_index >= count) {
+                break;
+            }
+        }
+
+        if (local_selected_threshold > 0) {
+            const int32_t begin = chunk_begin(num_actual_blocks, core_index, block_dim);
+            const int32_t end = chunk_end(num_actual_blocks, core_index, block_dim);
+            for (int32_t tile_begin = begin; tile_begin < end; tile_begin += kMetaTileElems) {
+                const int32_t tile_len = end - tile_begin > kMetaTileElems ? kMetaTileElems : (end - tile_begin);
+                load_tile_pad(meta_local, slot_meta + tile_begin, tile_len);
+                sync_pipe<AscendC::HardEvent::MTE2_S>(pipe);
+                for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
+                    const kvca_slotmeta_t meta = meta_local(inner_index);
+                    const int32_t pin_count = unpack_pin_count(meta);
+                    const int32_t usage_count = unpack_usage_count(meta);
+                    meta_local.SetValue(
+                        inner_index,
+                        pack_slot_meta(
+                            pin_count,
+                            usage_count > local_selected_threshold ? usage_count - local_selected_threshold : 0));
+                }
+                sync_pipe<AscendC::HardEvent::S_MTE3>(pipe);
+                store_tile_pad(slot_meta + tile_begin, meta_local, tile_len);
+                sync_pipe<AscendC::HardEvent::MTE3_S>(pipe);
+            }
+        }
+        return;
+    }
+
+    if (core_index != 0) {
+        return;
     }
 
     int64_t selected_count = 0;
@@ -442,6 +517,7 @@ void adapter_inspect_save_requests_kernel(
 }
 
 void adapter_pop_reusable_slots_kernel(
+    uint32_t block_dim,
     void *stream,
     kvca_slotmeta_t *slot_meta,
     int64_t *search_start,
@@ -450,14 +526,15 @@ void adapter_pop_reusable_slots_kernel(
     int32_t num_actual_blocks,
     int32_t num_blocked_slot_ids,
     int32_t count) {
-    adapter_pop_reusable_slots_entry<<<1, nullptr, stream>>>(
+    adapter_pop_reusable_slots_entry<<<block_dim, nullptr, stream>>>(
         launch_arg(slot_meta),
         launch_arg(search_start),
         launch_arg(blocked_slot_ids),
         launch_arg(selected_slot_ids_out),
         num_actual_blocks,
         num_blocked_slot_ids,
-        count);
+        count,
+        static_cast<int32_t>(block_dim));
 }
 
 void adapter_commit_load_metadata_kernel(

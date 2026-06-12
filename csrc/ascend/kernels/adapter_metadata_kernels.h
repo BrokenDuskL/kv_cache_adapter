@@ -49,6 +49,7 @@ void adapter_inspect_save_requests_kernel(
     int32_t num_logical_ids);
 
 void adapter_pop_reusable_slots_kernel(
+    uint32_t block_dim,
     void *stream,
     kvca_slotmeta_t *slot_meta,
     int64_t *search_start,
