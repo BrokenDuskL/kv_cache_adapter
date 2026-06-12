@@ -4,12 +4,48 @@
 
 namespace {
 
+constexpr int32_t kMetaTileElems = 256;
+
 __aicore__ inline int32_t chunk_begin(int32_t total, int32_t core_index, int32_t core_count) {
     return (total * core_index) / core_count;
 }
 
 __aicore__ inline int32_t chunk_end(int32_t total, int32_t core_index, int32_t core_count) {
     return (total * (core_index + 1)) / core_count;
+}
+
+__aicore__ inline uint32_t ceil_32_bytes(int32_t size) {
+    return size % 32 == 0 ? static_cast<uint32_t>(size) : static_cast<uint32_t>(32 * (1 + (size / 32)));
+}
+
+template <AscendC::HardEvent event>
+__aicore__ inline void sync_pipe(AscendC::TPipe &pipe) {
+    const int32_t event_id = static_cast<int32_t>(pipe.FetchEventID(event));
+    AscendC::SetFlag<event>(event_id);
+    AscendC::WaitFlag<event>(event_id);
+}
+
+template <typename T>
+__aicore__ inline void load_tile_pad(
+    const AscendC::LocalTensor<T> &local_tensor,
+    const __gm__ T *global_ptr,
+    int32_t len) {
+    AscendC::GlobalTensor<T> global_tensor;
+    global_tensor.SetGlobalBuffer(const_cast<__gm__ T *>(global_ptr), len);
+    AscendC::DataCopyExtParams copy_params{1, static_cast<uint32_t>(len * sizeof(T)), 0, 0, 0};
+    AscendC::DataCopyPadExtParams<T> pad_params{false, 0, 0, 0};
+    AscendC::DataCopyPad(local_tensor, global_tensor, copy_params, pad_params);
+}
+
+template <typename T>
+__aicore__ inline void store_tile_pad(
+    __gm__ T *global_ptr,
+    const AscendC::LocalTensor<T> &local_tensor,
+    int32_t len) {
+    AscendC::GlobalTensor<T> global_tensor;
+    global_tensor.SetGlobalBuffer(global_ptr, len);
+    AscendC::DataCopyExtParams copy_params{1, static_cast<uint32_t>(len * sizeof(T)), 0, 0, 0};
+    AscendC::DataCopyPad(global_tensor, local_tensor, copy_params);
 }
 
 template <typename T>
@@ -161,6 +197,14 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
     const int32_t end = chunk_end(num_actual_blocks, core_index, block_dim);
     const int64_t start = search_start[0];
 
+    AscendC::TPipe pipe;
+    AscendC::TBuf<> calc_buf;
+    const uint32_t meta_buffer_size = ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems);
+    const uint32_t blocked_buffer_size = ceil_32_bytes(sizeof(uint8_t) * kMetaTileElems);
+    pipe.InitBuffer(calc_buf, meta_buffer_size + blocked_buffer_size);
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, 0);
+    auto blocked_local = calc_buf.GetWithOffset<uint8_t>(kMetaTileElems, meta_buffer_size);
+
     int64_t local_count = 0;
     int32_t rotated_pos = begin;
     while (rotated_pos < end) {
@@ -168,14 +212,22 @@ extern "C" __global__ __aicore__ void adapter_count_threshold_slots_entry(
         const int32_t contiguous_len = ((end - rotated_pos) < (num_actual_blocks - actual_begin))
             ? (end - rotated_pos)
             : (num_actual_blocks - actual_begin);
-        for (int32_t offset = 0; offset < contiguous_len; ++offset) {
-            const int32_t slot_id = actual_begin + offset;
-            const kvca_slotmeta_t meta = slot_meta[slot_id];
-            if (blocked_mask[slot_id] == 0 &&
-                unpack_pin_count(meta) == 0 &&
-                unpack_usage_count(meta) == threshold) {
-                local_count += 1;
+        for (int32_t tile_offset = 0; tile_offset < contiguous_len; tile_offset += kMetaTileElems) {
+            const int32_t tile_len =
+                contiguous_len - tile_offset > kMetaTileElems ? kMetaTileElems : (contiguous_len - tile_offset);
+            const int32_t tile_begin = actual_begin + tile_offset;
+            load_tile_pad(meta_local, slot_meta + tile_begin, tile_len);
+            load_tile_pad(blocked_local, blocked_mask + tile_begin, tile_len);
+            sync_pipe<AscendC::HardEvent::MTE2_S>(pipe);
+            for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
+                const kvca_slotmeta_t meta = meta_local(inner_index);
+                if (blocked_local(inner_index) == 0 &&
+                    unpack_pin_count(meta) == 0 &&
+                    unpack_usage_count(meta) == threshold) {
+                    local_count += 1;
+                }
             }
+            sync_pipe<AscendC::HardEvent::S_MTE2>(pipe);
         }
         rotated_pos += contiguous_len;
     }
@@ -254,6 +306,14 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
     const int32_t end = chunk_end(num_actual_blocks, core_index, block_dim);
     const int64_t start = search_start[0];
 
+    AscendC::TPipe pipe;
+    AscendC::TBuf<> calc_buf;
+    const uint32_t meta_buffer_size = ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems);
+    const uint32_t blocked_buffer_size = ceil_32_bytes(sizeof(uint8_t) * kMetaTileElems);
+    pipe.InitBuffer(calc_buf, meta_buffer_size + blocked_buffer_size);
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, 0);
+    auto blocked_local = calc_buf.GetWithOffset<uint8_t>(kMetaTileElems, meta_buffer_size);
+
     int64_t written = 0;
     const int64_t write_offset = local_offset_workspace[core_index];
     int32_t rotated_pos = begin;
@@ -262,15 +322,23 @@ extern "C" __global__ __aicore__ void adapter_collect_threshold_slots_entry(
         const int32_t contiguous_len = ((end - rotated_pos) < (num_actual_blocks - actual_begin))
             ? (end - rotated_pos)
             : (num_actual_blocks - actual_begin);
-        for (int32_t offset = 0; offset < contiguous_len && written < emit_count; ++offset) {
-            const int32_t slot_id = actual_begin + offset;
-            const kvca_slotmeta_t meta = slot_meta[slot_id];
-            if (blocked_mask[slot_id] == 0 &&
-                unpack_pin_count(meta) == 0 &&
-                unpack_usage_count(meta) == threshold) {
-                selected_slot_ids_out[write_offset + written] = static_cast<int64_t>(slot_id);
-                written += 1;
+        for (int32_t tile_offset = 0; tile_offset < contiguous_len && written < emit_count; tile_offset += kMetaTileElems) {
+            const int32_t tile_len =
+                contiguous_len - tile_offset > kMetaTileElems ? kMetaTileElems : (contiguous_len - tile_offset);
+            const int32_t tile_begin = actual_begin + tile_offset;
+            load_tile_pad(meta_local, slot_meta + tile_begin, tile_len);
+            load_tile_pad(blocked_local, blocked_mask + tile_begin, tile_len);
+            sync_pipe<AscendC::HardEvent::MTE2_S>(pipe);
+            for (int32_t inner_index = 0; inner_index < tile_len && written < emit_count; ++inner_index) {
+                const kvca_slotmeta_t meta = meta_local(inner_index);
+                if (blocked_local(inner_index) == 0 &&
+                    unpack_pin_count(meta) == 0 &&
+                    unpack_usage_count(meta) == threshold) {
+                    selected_slot_ids_out[write_offset + written] = static_cast<int64_t>(tile_begin + inner_index);
+                    written += 1;
+                }
             }
+            sync_pipe<AscendC::HardEvent::S_MTE2>(pipe);
         }
         rotated_pos += contiguous_len;
     }
@@ -295,11 +363,26 @@ extern "C" __global__ __aicore__ void adapter_age_usage_entry(
         return;
     }
 
-    for (int32_t slot_id = begin; slot_id < end; ++slot_id) {
-        const kvca_slotmeta_t meta = slot_meta[slot_id];
-        const int32_t pin_count = unpack_pin_count(meta);
-        const int32_t usage_count = unpack_usage_count(meta);
-        slot_meta[slot_id] = pack_slot_meta(pin_count, usage_count > threshold ? usage_count - threshold : 0);
+    AscendC::TPipe pipe;
+    AscendC::TBuf<> calc_buf;
+    pipe.InitBuffer(calc_buf, ceil_32_bytes(sizeof(kvca_slotmeta_t) * kMetaTileElems));
+    auto meta_local = calc_buf.GetWithOffset<kvca_slotmeta_t>(kMetaTileElems, 0);
+
+    for (int32_t tile_begin = begin; tile_begin < end; tile_begin += kMetaTileElems) {
+        const int32_t tile_len = end - tile_begin > kMetaTileElems ? kMetaTileElems : (end - tile_begin);
+        load_tile_pad(meta_local, slot_meta + tile_begin, tile_len);
+        sync_pipe<AscendC::HardEvent::MTE2_S>(pipe);
+        for (int32_t inner_index = 0; inner_index < tile_len; ++inner_index) {
+            const kvca_slotmeta_t meta = meta_local(inner_index);
+            const int32_t pin_count = unpack_pin_count(meta);
+            const int32_t usage_count = unpack_usage_count(meta);
+            meta_local.SetValue(
+                inner_index,
+                pack_slot_meta(pin_count, usage_count > threshold ? usage_count - threshold : 0));
+        }
+        sync_pipe<AscendC::HardEvent::S_MTE3>(pipe);
+        store_tile_pad(slot_meta + tile_begin, meta_local, tile_len);
+        sync_pipe<AscendC::HardEvent::MTE3_S>(pipe);
     }
 }
 
