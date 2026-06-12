@@ -69,18 +69,45 @@ void check_same_device(
       " must be on the same device");
 }
 
-uint32_t block_dim_for(int64_t count) {
+int64_t block_dim_override() {
   const char *value = std::getenv("KVCA_NPU_BLOCK_DIM");
-  int64_t block_dim = 1;
   if (value != nullptr) {
     char *end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     if (end != value && parsed > 0) {
-      block_dim = static_cast<int64_t>(parsed);
+      return static_cast<int64_t>(parsed);
     }
   }
+  return 0;
+}
+
+uint32_t cap_block_dim(int64_t block_dim, int64_t count) {
   const int64_t capped = count > 0 ? std::min<int64_t>(block_dim, count) : block_dim;
   return static_cast<uint32_t>(std::max<int64_t>(1, capped));
+}
+
+uint32_t block_dim_for(int64_t count) {
+  const int64_t override = block_dim_override();
+  return cap_block_dim(override > 0 ? override : 1, count);
+}
+
+uint32_t pop_block_dim_for(int64_t num_actual_blocks, int64_t count) {
+  const int64_t override = block_dim_override();
+  if (override > 0) {
+    return cap_block_dim(override, std::min<int64_t>(num_actual_blocks, count));
+  }
+
+  // Tuned from benchmark_npu_block_dim.py with count=32. Dense cases are launch-bound,
+  // while tail scans start to benefit from more AICores on large slot tables.
+  int64_t block_dim = 1;
+  if (num_actual_blocks >= 12288) {
+    block_dim = 16;
+  } else if (num_actual_blocks >= 8192) {
+    block_dim = 8;
+  } else if (num_actual_blocks >= 3072) {
+    block_dim = 2;
+  }
+  return cap_block_dim(block_dim, std::min<int64_t>(num_actual_blocks, count));
 }
 
 }  // namespace
@@ -179,7 +206,7 @@ torch::Tensor pop_reusable_slots(
 
   const c10::OptionalDeviceGuard device_guard(slot_meta.device());
   const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-  auto block_dim = block_dim_for(std::min<int64_t>(slot_meta.numel(), count));
+  auto block_dim = pop_block_dim_for(slot_meta.numel(), count);
   if (slot_meta.numel() < 128) {
     block_dim = 1;
   }
