@@ -218,7 +218,7 @@ class KVCacheAdapter:
         if logical_block_ids.numel() == 0:
             return
 
-        current_physical, existing_mask, _ = self._inspect_save_requests(logical_block_ids)
+        current_physical, existing_mask, inspected_usage_counts = self._inspect_save_requests(logical_block_ids)
         existing_positions = _selected_positions(existing_mask)
         missing_positions = _unselected_positions(existing_mask)
         existing_physical = current_physical.index_select(0, existing_positions)
@@ -229,13 +229,16 @@ class KVCacheAdapter:
         if missing_ids.numel() > 0:
             selected_physical.index_copy_(0, missing_positions, allocated_physical)
 
-        final_pin_counts = self._pin_count.index_select(0, selected_physical)
-        final_usage_counts = torch.ones_like(logical_block_ids, dtype=USAGE_DTYPE)
-        if existing_physical.numel() > 0:
+        final_pin_counts = _slot_meta_pin_counts(self._slot_meta.index_select(0, selected_physical))
+        final_usage_counts = inspected_usage_counts
+        if missing_ids.numel() > 0 and existing_physical.numel() > 0:
+            final_usage_counts = torch.ones_like(logical_block_ids, dtype=USAGE_DTYPE)
             final_usage_counts.index_copy_(
                 0,
                 existing_positions,
-                _saturating_increment_usage(self._usage_count.index_select(0, existing_physical)),
+                _saturating_increment_usage(
+                    _slot_meta_usage_counts(self._slot_meta.index_select(0, existing_physical)),
+                ),
             )
         eviction_plan = self._build_eviction_plan(logical_block_ids, selected_physical)
 
@@ -258,7 +261,7 @@ class KVCacheAdapter:
         if logical_block_ids.numel() == 0:
             return torch.empty_like(logical_block_ids)
 
-        current_physical, resident_mask, updated_pin_counts, _ = self._inspect_load_requests(
+        current_physical, resident_mask, updated_pin_counts, updated_usage_counts = self._inspect_load_requests(
             logical_block_ids,
         )
         resident_positions = _selected_positions(resident_mask)
@@ -277,14 +280,21 @@ class KVCacheAdapter:
                 miss_physical_slot_ids,
             )
 
-        hit_usage_counts = _saturating_increment_usage(
-            self._usage_count.index_select(0, hit_slot_ids),
-        )
+        if miss_logical_ids.numel() > 0 and hit_slot_ids.numel() > 0:
+            hit_usage_counts = _saturating_increment_usage(
+                _slot_meta_usage_counts(self._slot_meta.index_select(0, hit_slot_ids)),
+            )
+        else:
+            hit_usage_counts = updated_usage_counts.index_select(0, resident_positions)
         miss_usage_counts = torch.ones(
             (miss_physical_slot_ids.shape[0],),
             dtype=USAGE_DTYPE,
             device=self.actual_blocks.device,
         )
+        result_physical = current_physical
+        if miss_positions.numel() > 0:
+            result_physical = current_physical.clone()
+            result_physical.index_copy_(0, miss_positions, miss_physical_slot_ids)
         self._commit_load_metadata(
             evicted_logical_block_ids=eviction_plan.logical_block_ids,
             miss_logical_block_ids=miss_logical_ids,
@@ -294,7 +304,7 @@ class KVCacheAdapter:
             hit_usage_counts=hit_usage_counts,
             miss_usage_counts=miss_usage_counts,
         )
-        return self._logical_to_physical.index_select(0, logical_block_ids)
+        return result_physical
 
     def release(self, logical_block_ids: torch.Tensor) -> None:
         _require_id_tensor(logical_block_ids, name="logical_block_ids")
@@ -527,11 +537,9 @@ class KVCacheAdapter:
             (previous_logical_ids >= 0)
             & (previous_logical_ids != logical_block_ids)
         )
-        if not torch.any(eviction_mask):
-            return _EvictionPlan(logical_block_ids[:0], self.actual_blocks[:0])
-
-        eviction_logical_ids = previous_logical_ids[eviction_mask]
-        eviction_slot_ids = physical_slot_ids[eviction_mask]
+        eviction_positions = _selected_positions(eviction_mask)
+        eviction_logical_ids = previous_logical_ids.index_select(0, eviction_positions)
+        eviction_slot_ids = physical_slot_ids.index_select(0, eviction_positions)
         eviction_payloads = self.actual_blocks.index_select(0, eviction_slot_ids)
         return _EvictionPlan(eviction_logical_ids, eviction_payloads)
 

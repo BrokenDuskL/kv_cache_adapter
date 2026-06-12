@@ -133,11 +133,17 @@ void check_same_device(
 }
 
 uint32_t block_dim_for(int64_t count) {
-  (void)count;
-  // The Ascend metadata kernels are currently correctness-sensitive to the
-  // block partitioning path; run them on a single block until the multi-block
-  // partition logic is proven correct on hardware.
-  return 1;
+  const char *value = std::getenv("KVCA_NPU_BLOCK_DIM");
+  int64_t block_dim = 1;
+  if (value != nullptr) {
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end != value && parsed > 0) {
+      block_dim = static_cast<int64_t>(parsed);
+    }
+  }
+  const int64_t capped = count > 0 ? std::min<int64_t>(block_dim, count) : block_dim;
+  return static_cast<uint32_t>(std::max<int64_t>(1, capped));
 }
 
 const char *pop_debug_fields() {
